@@ -1,0 +1,79 @@
+# MCP Server + Redis — Tier 2 Compose Stack
+# Usage: docker compose up -d
+# Dev:   docker compose -f docker-compose.yml -f docker-compose.override.yml up
+
+services:
+  # ── MCP Server ───────────────────────────────────
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MCP_SERVER_NAME=${MCP_SERVER_NAME:-mcp-server}
+      - MCP_TRANSPORT=${MCP_TRANSPORT:-streamable-http}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - mcp-network
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=50M
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  # ── Redis (Caching Layer) ────────────────────────
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - "128mb"
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "yes"
+    volumes:
+      - redis-data:/data
+    networks:
+      - mcp-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+# ── Networks ───────────────────────────────────────
+networks:
+  mcp-network:
+    driver: bridge
+
+# ── Volumes ────────────────────────────────────────
+volumes:
+  redis-data:
+    driver: local

@@ -1,0 +1,124 @@
+# Harbor Helm Chart Values — Enterprise Registry
+# Usage: helm install harbor harbor/harbor -f harbor_values.yaml -n harbor
+# Docs: https://goharbor.io/docs/
+
+# ── External Access ────────────────────────────────
+expose:
+  type: ingress
+  tls:
+    enabled: true
+    certSource: secret
+    secret:
+      secretName: harbor-tls
+  ingress:
+    hosts:
+      core: registry.{{DOMAIN}}
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-body-size: "0"
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+externalURL: https://registry.{{DOMAIN}}
+
+# ── Persistence ────────────────────────────────────
+persistence:
+  enabled: true
+  resourcePolicy: "keep"
+  persistentVolumeClaim:
+    registry:
+      storageClass: "gp3"
+      size: 500Gi
+    database:
+      storageClass: "gp3"
+      size: 50Gi
+    redis:
+      storageClass: "gp3"
+      size: 10Gi
+    trivy:
+      storageClass: "gp3"
+      size: 10Gi
+
+# ── Components ─────────────────────────────────────
+# Trivy vulnerability scanner
+trivy:
+  enabled: true
+  gitHubToken: ""
+  skipUpdate: false
+
+# Notary — image signing (Docker Content Trust)
+notary:
+  enabled: true
+
+# ── Database ───────────────────────────────────────
+database:
+  type: external
+  external:
+    host: "{{RDS_ENDPOINT}}"
+    port: "5432"
+    username: "harbor"
+    password: "{{DB_PASSWORD}}"
+    coreDatabase: "harbor_core"
+
+# ── Redis ──────────────────────────────────────────
+redis:
+  type: external
+  external:
+    addr: "{{ELASTICACHE_ENDPOINT}}:6379"
+    password: "{{REDIS_PASSWORD}}"
+
+# ── Storage Backend (S3) ───────────────────────────
+imageChartStorage:
+  type: s3
+  s3:
+    region: us-east-1
+    bucket: "{{S3_BUCKET}}"
+    encrypt: true
+    secure: true
+
+# ── Security ───────────────────────────────────────
+harborAdminPassword: "{{ADMIN_PASSWORD}}"
+
+# Auto-scan on push
+autoScan:
+  enabled: true
+
+# ── Resource Limits ────────────────────────────────
+core:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+
+registry:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+
+jobservice:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+# ── Garbage Collection ─────────────────────────────
+# Schedule: daily at 2 AM UTC
+gc:
+  enabled: true
+  schedule: "0 2 * * *"
+  deleteUntagged: true
+
+# ── Replication (Geo) ──────────────────────────────
+# Configure via Harbor UI after installation:
+# 1. Add remote registry endpoint
+# 2. Create replication rule (push-based)
+# 3. Set trigger: event-based or scheduled

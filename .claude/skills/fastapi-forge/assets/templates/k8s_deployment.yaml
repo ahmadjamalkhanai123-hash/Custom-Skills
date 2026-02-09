@@ -1,0 +1,87 @@
+# {{SERVICE_NAME}} — Kubernetes Deployment + Service
+# Apply: kubectl apply -f k8s_deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{SERVICE_NAME}}
+  labels:
+    app: {{SERVICE_NAME}}
+spec:
+  replicas: {{REPLICAS}}
+  selector:
+    matchLabels:
+      app: {{SERVICE_NAME}}
+  template:
+    metadata:
+      labels:
+        app: {{SERVICE_NAME}}
+    spec:
+      containers:
+      - name: api
+        image: {{IMAGE_REGISTRY}}/{{SERVICE_NAME}}:latest
+        ports:
+        - containerPort: 8000
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: {{SERVICE_NAME}}-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: {{SERVICE_NAME}}-secrets
+              key: redis-url
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{SERVICE_NAME}}-secrets
+              key: jwt-secret
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{SERVICE_NAME}}-secrets
+              key: anthropic-api-key
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{SERVICE_NAME}}
+spec:
+  selector:
+    app: {{SERVICE_NAME}}
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: ClusterIP
+
+---
+
+# Secrets (create separately, do NOT commit to git)
+# kubectl create secret generic {{SERVICE_NAME}}-secrets \
+#   --from-literal=database-url='postgresql+asyncpg://...' \
+#   --from-literal=redis-url='redis://...' \
+#   --from-literal=jwt-secret='...' \
+#   --from-literal=anthropic-api-key='...'

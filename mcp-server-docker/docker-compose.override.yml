@@ -1,0 +1,31 @@
+# Development Override — Hot Reload + Debug
+# Auto-loaded by docker compose when present
+# Usage: docker compose up
+
+services:
+  mcp-server:
+    build:
+      target: builder
+    command: ["python", "-m", "src.server", "--host", "0.0.0.0", "--port", "8000"]
+    volumes:
+      - ./src:/app/src:cached
+      - ./tests:/app/tests:cached
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+      - "${DEBUG_PORT:-5678}:5678"
+    environment:
+      - LOG_LEVEL=debug
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+    read_only: false
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+    healthcheck:
+      disable: true
+
+  redis:
+    ports:
+      - "${REDIS_PORT:-6379}:6379"

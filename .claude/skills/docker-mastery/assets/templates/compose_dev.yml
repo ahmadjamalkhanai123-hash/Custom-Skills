@@ -1,0 +1,61 @@
+# Development Override — Hot Reload + Debug
+# Usage: docker compose -f compose_full_stack.yml -f compose_dev.yml up
+
+services:
+  app:
+    build:
+      target: builder  # Use build stage with dev deps
+    command: ["uvicorn", "src.main:app", "--reload", "--host", "0.0.0.0", "--port", "8000"]
+    volumes:
+      - ./src:/app/src:cached         # Hot reload source
+      - ./tests:/app/tests:cached     # Tests accessible
+    ports:
+      - "${APP_PORT:-8000}:8000"      # Direct access (bypass nginx)
+      - "${DEBUG_PORT:-5678}:5678"    # Debugger port (debugpy)
+    environment:
+      - LOG_LEVEL=debug
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+    read_only: false                  # Allow writes in dev
+    deploy:
+      replicas: 1                     # Single instance in dev
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 2G
+    healthcheck:
+      disable: true                   # Faster restarts in dev
+
+  db:
+    ports:
+      - "${DB_PORT:-5432}:5432"       # Direct DB access for tools
+
+  redis:
+    ports:
+      - "${REDIS_PORT:-6379}:6379"    # Direct Redis access
+
+  nginx:
+    profiles:
+      - proxy                         # Only start with --profile proxy
+
+  # ── Dev Tools (optional profiles) ────────────────
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "8025:8025"   # Web UI
+      - "1025:1025"   # SMTP
+    profiles:
+      - mail
+    networks:
+      - backend
+
+  adminer:
+    image: adminer:latest
+    ports:
+      - "8080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    profiles:
+      - dbtools
+    networks:
+      - backend

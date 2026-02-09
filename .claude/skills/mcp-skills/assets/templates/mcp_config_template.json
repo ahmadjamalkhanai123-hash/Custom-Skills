@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "{{SERVER_NAME}}": {
+      "command": "uv",
+      "args": ["run", "--directory", "{{PROJECT_PATH}}", "{{SERVER_NAME}}"],
+      "env": {
+        "{{ENV_VAR_1}}": "{{ENV_VALUE_1}}"
+      }
+    }
+  }
+}
