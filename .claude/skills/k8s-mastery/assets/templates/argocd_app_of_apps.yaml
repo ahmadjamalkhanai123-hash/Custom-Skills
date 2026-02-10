@@ -1,0 +1,118 @@
+# ArgoCD App-of-Apps Root Application
+# Manages all team and platform applications from a single root
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: "{{PROJECT_NAME}}"
+  namespace: argocd
+spec:
+  description: "{{PROJECT_DESCRIPTION}}"
+  sourceRepos:
+    - "{{GITOPS_REPO_URL}}"
+  destinations:
+    - namespace: "*"
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota  # Managed by platform team only
+  roles:
+    - name: developer
+      description: Read-only access
+      policies:
+        - "p, proj:{{PROJECT_NAME}}:developer, applications, get, {{PROJECT_NAME}}/*, allow"
+        - "p, proj:{{PROJECT_NAME}}:developer, applications, sync, {{PROJECT_NAME}}/*, deny"
+      groups:
+        - "oidc:{{TEAM}}-developers"
+    - name: deployer
+      description: Sync access for CI/CD
+      policies:
+        - "p, proj:{{PROJECT_NAME}}:deployer, applications, *, {{PROJECT_NAME}}/*, allow"
+      groups:
+        - "oidc:{{TEAM}}-sre"
+---
+# Root Application — manages all child apps
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-app
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: "{{PROJECT_NAME}}"
+  source:
+    repoURL: "{{GITOPS_REPO_URL}}"
+    targetRevision: main
+    path: apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+---
+# Platform Application — infra components
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform
+  namespace: argocd
+spec:
+  project: "{{PROJECT_NAME}}"
+  source:
+    repoURL: "{{GITOPS_REPO_URL}}"
+    targetRevision: main
+    path: platform
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+---
+# Monitoring Application
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring
+  namespace: argocd
+spec:
+  project: "{{PROJECT_NAME}}"
+  source:
+    repoURL: "{{GITOPS_REPO_URL}}"
+    targetRevision: main
+    path: platform/prometheus-stack
+    helm:
+      valueFiles:
+        - values.yaml
+        - "values-{{ENV}}.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

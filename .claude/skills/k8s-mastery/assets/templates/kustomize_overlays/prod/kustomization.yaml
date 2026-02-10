@@ -1,0 +1,48 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: "{{APP_NAME}}-prod"
+
+resources:
+  - ../../kustomize_base
+  - pdb.yaml
+  - hpa.yaml
+  - networkpolicy.yaml
+
+replicas:
+  - name: "{{APP_NAME}}"
+    count: 3
+
+patches:
+  - target:
+      kind: Deployment
+      name: "{{APP_NAME}}"
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 250m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 256Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/cpu
+        value: "1"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 1Gi
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: "{{APP_NAME}}"
+
+configMapGenerator:
+  - name: "{{APP_NAME}}-config"
+    behavior: merge
+    literals:
+      - APP_ENV=production
+      - LOG_LEVEL=warn

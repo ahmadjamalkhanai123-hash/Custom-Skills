@@ -1,0 +1,97 @@
+# ArgoCD ApplicationSet — Multi-Cluster + Multi-Team Generator
+# Automatically creates Applications for each team/env/cluster combination
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: team-apps
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - matrix:
+        generators:
+          # Source 1: discover team/env directories in Git
+          - git:
+              repoURL: "{{GITOPS_REPO_URL}}"
+              revision: main
+              directories:
+                - path: "teams/*/envs/*"
+          # Source 2: target clusters
+          - list:
+              elements:
+                - cluster: us-east
+                  url: "{{US_EAST_CLUSTER_URL}}"
+                  region: us-east-1
+                - cluster: eu-west
+                  url: "{{EU_WEST_CLUSTER_URL}}"
+                  region: eu-west-1
+                # Add more clusters as needed
+  template:
+    metadata:
+      name: "{{ index .path.segments 1 }}-{{ .path.basename }}-{{ .cluster }}"
+      namespace: argocd
+      labels:
+        team: "{{ index .path.segments 1 }}"
+        environment: "{{ .path.basename }}"
+        cluster: "{{ .cluster }}"
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: "k8s-deployments"
+    spec:
+      project: "{{ index .path.segments 1 }}"
+      source:
+        repoURL: "{{GITOPS_REPO_URL}}"
+        targetRevision: main
+        path: "{{ .path.path }}"
+      destination:
+        server: "{{ .url }}"
+        namespace: "{{ .path.basename }}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - PrunePropagationPolicy=foreground
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      ignoreDifferences:
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas  # Allow HPA to manage
+---
+# Cluster-specific platform components
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: cluster-platform
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            environment: production
+  template:
+    metadata:
+      name: "platform-{{ .name }}"
+      namespace: argocd
+    spec:
+      project: platform
+      source:
+        repoURL: "{{GITOPS_REPO_URL}}"
+        targetRevision: main
+        path: "clusters/{{ .name }}/platform"
+      destination:
+        server: "{{ .server }}"
+        namespace: platform
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true

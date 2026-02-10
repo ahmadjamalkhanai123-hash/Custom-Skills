@@ -1,0 +1,155 @@
+# Istio Service Mesh — Authorization + mTLS + Traffic Management
+# Requires: Istio 1.24+ installed
+
+# Strict mTLS for entire mesh
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+---
+# Namespace-level mTLS (if per-namespace control needed)
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: "{{NAMESPACE}}"
+spec:
+  mtls:
+    mode: STRICT
+---
+# L7 AuthorizationPolicy: only specific services can access
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: "{{APP_NAME}}-authz"
+  namespace: "{{NAMESPACE}}"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: "{{APP_NAME}}"
+  action: ALLOW
+  rules:
+    # Allow from API gateway
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/gateway/sa/api-gateway"
+      to:
+        - operation:
+            methods: ["GET", "POST", "PUT", "DELETE"]
+            paths: ["/api/*"]
+    # Allow from specific upstream service
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/{{UPSTREAM_NS}}/sa/{{UPSTREAM_SA}}"
+      to:
+        - operation:
+            methods: ["GET", "POST"]
+            paths: ["/api/v1/{{APP_NAME}}/*"]
+    # Allow Prometheus scraping
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/monitoring/sa/prometheus"
+      to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/metrics", "/health", "/health/ready"]
+---
+# Default deny for namespace (deny all unless explicitly allowed)
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: default-deny
+  namespace: "{{NAMESPACE}}"
+spec:
+  {}  # Empty spec = deny all
+---
+# VirtualService: traffic splitting for canary
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: "{{APP_NAME}}"
+  namespace: "{{NAMESPACE}}"
+spec:
+  hosts:
+    - "{{APP_NAME}}"
+    - "{{APP_NAME}}.{{DOMAIN}}"
+  gateways:
+    - mesh
+    - "gateway/main-gateway"
+  http:
+    # Header-based routing (canary testing)
+    - match:
+        - headers:
+            x-canary:
+              exact: "true"
+      route:
+        - destination:
+            host: "{{APP_NAME}}-canary"
+            port:
+              number: 8080
+    # Weighted traffic split
+    - route:
+        - destination:
+            host: "{{APP_NAME}}-stable"
+            port:
+              number: 8080
+          weight: 95
+        - destination:
+            host: "{{APP_NAME}}-canary"
+            port:
+              number: 8080
+          weight: 5
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+        retryOn: connect-failure,refused-stream,unavailable
+      timeout: 10s
+---
+# DestinationRule: connection pool and outlier detection
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: "{{APP_NAME}}"
+  namespace: "{{NAMESPACE}}"
+spec:
+  host: "{{APP_NAME}}"
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+        connectTimeout: 5s
+      http:
+        h2UpgradePolicy: DEFAULT
+        maxRequestsPerConnection: 10
+        maxRetries: 3
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+    tls:
+      mode: ISTIO_MUTUAL
+---
+# RequestAuthentication: validate JWT tokens at mesh level
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: "{{APP_NAME}}-jwt"
+  namespace: "{{NAMESPACE}}"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: "{{APP_NAME}}"
+  jwtRules:
+    - issuer: "https://auth.{{DOMAIN}}"
+      jwksUri: "https://auth.{{DOMAIN}}/.well-known/jwks.json"
+      audiences: ["{{APP_NAME}}"]
+      forwardOriginalToken: true
+      outputPayloadToHeader: x-jwt-payload

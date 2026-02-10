@@ -1,0 +1,125 @@
+# Gateway API — Modern Ingress Replacement
+# apiVersion: gateway.networking.k8s.io/v1 (GA since K8s 1.29+)
+
+# GatewayClass (typically provided by mesh/controller installation)
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: "{{GATEWAY_CLASS}}"
+spec:
+  controllerName: "{{CONTROLLER_NAME}}"  # e.g., istio.io/gateway-controller
+
+---
+# Gateway: entry point for external traffic
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: main-gateway
+  namespace: gateway
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  gatewayClassName: "{{GATEWAY_CLASS}}"
+  listeners:
+    # HTTPS listener with wildcard TLS
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: "*.{{DOMAIN}}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: wildcard-tls
+            kind: Secret
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              gateway-access: "true"
+    # HTTP redirect to HTTPS
+    - name: http-redirect
+      port: 80
+      protocol: HTTP
+      hostname: "*.{{DOMAIN}}"
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+# HTTPRoute: route traffic to backend services
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: "{{APP_NAME}}-route"
+  namespace: "{{NAMESPACE}}"
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: gateway
+      sectionName: https
+  hostnames:
+    - "{{APP_NAME}}.{{DOMAIN}}"
+  rules:
+    # Main route
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: "{{APP_NAME}}-api"
+          port: 8080
+          weight: 100
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Request-ID
+                value: "{{request.id}}"
+    # Canary route (header-based)
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+          headers:
+            - name: x-canary
+              value: "true"
+      backendRefs:
+        - name: "{{APP_NAME}}-api-canary"
+          port: 8080
+          weight: 100
+    # Weighted canary (percentage-based)
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v2
+      backendRefs:
+        - name: "{{APP_NAME}}-api-stable"
+          port: 8080
+          weight: 90
+        - name: "{{APP_NAME}}-api-canary"
+          port: 8080
+          weight: 10
+---
+# HTTPRoute: rate limiting and timeout
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: "{{APP_NAME}}-health"
+  namespace: "{{NAMESPACE}}"
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: gateway
+  hostnames:
+    - "{{APP_NAME}}.{{DOMAIN}}"
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /health
+      backendRefs:
+        - name: "{{APP_NAME}}-api"
+          port: 8080
+      timeouts:
+        request: 5s
+        backendRequest: 3s

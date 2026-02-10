@@ -1,0 +1,39 @@
+# Production overrides
+replicaCount: 3
+
+image:
+  pullPolicy: IfNotPresent
+  # Always use digest in production
+  # digest: "sha256:abc123..."
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+
+pdb:
+  enabled: true
+  minAvailable: 2
+
+networkPolicy:
+  enabled: true
+
+serviceMonitor:
+  enabled: true
+  interval: 15s
+
+externalSecret:
+  enabled: true
+
+configMap:
+  data:
+    APP_ENV: "production"
+    LOG_LEVEL: "warn"

@@ -1,0 +1,36 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: "{{APP_NAME}}-dev"
+
+resources:
+  - ../../kustomize_base
+
+replicas:
+  - name: "{{APP_NAME}}"
+    count: 1
+
+patches:
+  - target:
+      kind: Deployment
+      name: "{{APP_NAME}}"
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 50m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 64Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/cpu
+        value: 250m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 256Mi
+
+configMapGenerator:
+  - name: "{{APP_NAME}}-config"
+    behavior: merge
+    literals:
+      - APP_ENV=development
+      - LOG_LEVEL=debug

@@ -1,0 +1,115 @@
+# Velero Backup Schedules — Disaster Recovery
+# Requires: velero installed with appropriate storage backend
+
+# Daily full cluster backup
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: daily-full-backup
+  namespace: velero
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM UTC
+  template:
+    includedNamespaces: ["*"]
+    excludedNamespaces: ["kube-system", "kube-public", "velero"]
+    includedResources: ["*"]
+    excludedResources: ["events", "events.events.k8s.io"]
+    storageLocation: default
+    volumeSnapshotLocations: ["default"]
+    ttl: 720h  # 30 days retention
+    snapshotMoveData: true
+    defaultVolumesToFsBackup: false
+    metadata:
+      labels:
+        backup-type: daily-full
+---
+# Hourly backup for critical namespaces
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: hourly-critical
+  namespace: velero
+spec:
+  schedule: "0 * * * *"  # Every hour
+  template:
+    includedNamespaces:
+      - "{{CRITICAL_NS_1}}"
+      - "{{CRITICAL_NS_2}}"
+    labelSelector:
+      matchLabels:
+        backup: critical
+    storageLocation: cross-region
+    volumeSnapshotLocations: ["cross-region"]
+    ttl: 168h  # 7 days retention
+    metadata:
+      labels:
+        backup-type: hourly-critical
+---
+# Weekly etcd-level backup (cluster state)
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: weekly-cluster-state
+  namespace: velero
+spec:
+  schedule: "0 1 * * 0"  # Sunday 1 AM UTC
+  template:
+    includedResources:
+      - namespaces
+      - clusterroles
+      - clusterrolebindings
+      - customresourcedefinitions
+      - storageclasses
+      - persistentvolumes
+    excludedNamespaces: []
+    storageLocation: default
+    ttl: 2160h  # 90 days retention
+    metadata:
+      labels:
+        backup-type: weekly-cluster
+---
+# BackupStorageLocation: primary (same region)
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: default
+  namespace: velero
+spec:
+  provider: aws
+  objectStorage:
+    bucket: "{{BACKUP_BUCKET}}"
+    prefix: velero/primary
+  config:
+    region: "{{AWS_REGION}}"
+    s3ForcePathStyle: "false"
+  credential:
+    name: velero-credentials
+    key: cloud
+---
+# BackupStorageLocation: cross-region (DR)
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: cross-region
+  namespace: velero
+spec:
+  provider: aws
+  objectStorage:
+    bucket: "{{DR_BACKUP_BUCKET}}"
+    prefix: velero/dr
+  config:
+    region: "{{DR_AWS_REGION}}"
+  credential:
+    name: velero-credentials
+    key: cloud
+---
+# VolumeSnapshotLocation
+apiVersion: velero.io/v1
+kind: VolumeSnapshotLocation
+metadata:
+  name: default
+  namespace: velero
+spec:
+  provider: aws
+  config:
+    region: "{{AWS_REGION}}"

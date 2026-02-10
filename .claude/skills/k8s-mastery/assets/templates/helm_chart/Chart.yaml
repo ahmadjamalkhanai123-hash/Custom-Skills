@@ -1,0 +1,24 @@
+apiVersion: v2
+name: "{{CHART_NAME}}"
+description: "{{CHART_DESCRIPTION}}"
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.28.0"
+keywords:
+  - "{{APP_NAME}}"
+  - kubernetes
+  - k8s-mastery
+maintainers:
+  - name: "{{TEAM}}"
+    email: "{{TEAM_EMAIL}}"
+dependencies: []
+  # Uncomment as needed:
+  # - name: postgresql
+  #   version: "15.x.x"
+  #   repository: "https://charts.bitnami.com/bitnami"
+  #   condition: postgresql.enabled
+  # - name: redis
+  #   version: "19.x.x"
+  #   repository: "https://charts.bitnami.com/bitnami"
+  #   condition: redis.enabled

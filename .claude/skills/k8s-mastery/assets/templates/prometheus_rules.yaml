@@ -1,0 +1,156 @@
+# SLO/SLI Alerting Rules — Production PrometheusRules
+# Deploy with kube-prometheus-stack
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: "{{APP_NAME}}-slos"
+  namespace: "{{NAMESPACE}}"
+  labels:
+    release: prometheus  # Match kube-prometheus-stack label selector
+    app.kubernetes.io/name: "{{APP_NAME}}"
+spec:
+  groups:
+    # ── SLI Recording Rules ──────────────────────────────────────
+    - name: "{{APP_NAME}}-sli-records"
+      interval: 30s
+      rules:
+        # Request success rate (5m window)
+        - record: "{{APP_NAME}}:http_request_success_rate:5m"
+          expr: |
+            sum(rate(http_requests_total{namespace="{{NAMESPACE}}",service="{{APP_NAME}}",code=~"2.."}[5m]))
+            / sum(rate(http_requests_total{namespace="{{NAMESPACE}}",service="{{APP_NAME}}"}[5m]))
+
+        # Request success rate (1h window for burn rate)
+        - record: "{{APP_NAME}}:http_request_success_rate:1h"
+          expr: |
+            sum(rate(http_requests_total{namespace="{{NAMESPACE}}",service="{{APP_NAME}}",code=~"2.."}[1h]))
+            / sum(rate(http_requests_total{namespace="{{NAMESPACE}}",service="{{APP_NAME}}"}[1h]))
+
+        # P50 latency
+        - record: "{{APP_NAME}}:http_request_duration_p50:5m"
+          expr: |
+            histogram_quantile(0.50,
+              sum(rate(http_request_duration_seconds_bucket{namespace="{{NAMESPACE}}",service="{{APP_NAME}}"}[5m]))
+              by (le))
+
+        # P99 latency
+        - record: "{{APP_NAME}}:http_request_duration_p99:5m"
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{namespace="{{NAMESPACE}}",service="{{APP_NAME}}"}[5m]))
+              by (le))
+
+        # Error rate
+        - record: "{{APP_NAME}}:http_error_rate:5m"
+          expr: |
+            sum(rate(http_requests_total{namespace="{{NAMESPACE}}",service="{{APP_NAME}}",code=~"5.."}[5m]))
+            / sum(rate(http_requests_total{namespace="{{NAMESPACE}}",service="{{APP_NAME}}"}[5m]))
+
+    # ── SLO Alerts ───────────────────────────────────────────────
+    - name: "{{APP_NAME}}-slo-alerts"
+      rules:
+        # SLO: 99.9% availability — critical (fast burn)
+        - alert: "{{APP_NAME}}AvailabilitySLOCritical"
+          expr: "{{APP_NAME}}:http_request_success_rate:5m < 0.999"
+          for: 2m
+          labels:
+            severity: critical
+            team: "{{TEAM}}"
+            slo: availability
+          annotations:
+            summary: "{{APP_NAME}} below 99.9% availability SLO"
+            description: |
+              Success rate: {{ $value | humanizePercentage }} (target: 99.9%)
+              Namespace: {{NAMESPACE}}
+            runbook_url: "https://wiki.company.com/runbooks/{{APP_NAME}}/availability"
+
+        # SLO: 99.9% availability — warning (slow burn)
+        - alert: "{{APP_NAME}}AvailabilitySLOWarning"
+          expr: "{{APP_NAME}}:http_request_success_rate:1h < 0.999"
+          for: 15m
+          labels:
+            severity: warning
+            team: "{{TEAM}}"
+            slo: availability
+          annotations:
+            summary: "{{APP_NAME}} slow burn on availability SLO"
+
+        # SLO: P99 latency < 500ms
+        - alert: "{{APP_NAME}}LatencySLOBreach"
+          expr: "{{APP_NAME}}:http_request_duration_p99:5m > 0.5"
+          for: 5m
+          labels:
+            severity: warning
+            team: "{{TEAM}}"
+            slo: latency
+          annotations:
+            summary: "{{APP_NAME}} P99 latency above 500ms SLO"
+            description: "P99: {{ $value | humanizeDuration }} (target: 500ms)"
+
+        # SLO: P99 latency < 2s (critical)
+        - alert: "{{APP_NAME}}LatencySLOCritical"
+          expr: "{{APP_NAME}}:http_request_duration_p99:5m > 2.0"
+          for: 2m
+          labels:
+            severity: critical
+            team: "{{TEAM}}"
+            slo: latency
+          annotations:
+            summary: "{{APP_NAME}} P99 latency above 2s — critical"
+
+        # Error rate spike
+        - alert: "{{APP_NAME}}ErrorRateHigh"
+          expr: "{{APP_NAME}}:http_error_rate:5m > 0.05"
+          for: 5m
+          labels:
+            severity: critical
+            team: "{{TEAM}}"
+          annotations:
+            summary: "{{APP_NAME}} error rate above 5%"
+            description: "Error rate: {{ $value | humanizePercentage }}"
+
+    # ── Infrastructure Alerts ────────────────────────────────────
+    - name: "{{APP_NAME}}-infra-alerts"
+      rules:
+        - alert: "{{APP_NAME}}PodCrashLooping"
+          expr: |
+            rate(kube_pod_container_status_restarts_total{namespace="{{NAMESPACE}}",container="{{APP_NAME}}"}[15m]) * 60 * 15 > 3
+          for: 5m
+          labels:
+            severity: critical
+            team: "{{TEAM}}"
+          annotations:
+            summary: "{{APP_NAME}} pod crash looping"
+
+        - alert: "{{APP_NAME}}HighMemoryUsage"
+          expr: |
+            container_memory_working_set_bytes{namespace="{{NAMESPACE}}",container="{{APP_NAME}}"}
+            / container_spec_memory_limit_bytes{namespace="{{NAMESPACE}}",container="{{APP_NAME}}"} > 0.9
+          for: 5m
+          labels:
+            severity: warning
+            team: "{{TEAM}}"
+          annotations:
+            summary: "{{APP_NAME}} memory usage above 90%"
+
+        - alert: "{{APP_NAME}}HighCPUUsage"
+          expr: |
+            rate(container_cpu_usage_seconds_total{namespace="{{NAMESPACE}}",container="{{APP_NAME}}"}[5m])
+            / container_spec_cpu_quota{namespace="{{NAMESPACE}}",container="{{APP_NAME}}"} * 100000 > 0.9
+          for: 10m
+          labels:
+            severity: warning
+            team: "{{TEAM}}"
+          annotations:
+            summary: "{{APP_NAME}} CPU usage above 90%"
+
+        - alert: "{{APP_NAME}}PDBViolation"
+          expr: |
+            kube_poddisruptionbudget_status_current_healthy{namespace="{{NAMESPACE}}",poddisruptionbudget="{{APP_NAME}}-pdb"}
+            < kube_poddisruptionbudget_status_desired_healthy{namespace="{{NAMESPACE}}",poddisruptionbudget="{{APP_NAME}}-pdb"}
+          for: 5m
+          labels:
+            severity: warning
+            team: "{{TEAM}}"
+          annotations:
+            summary: "{{APP_NAME}} PDB violated — fewer healthy pods than desired"

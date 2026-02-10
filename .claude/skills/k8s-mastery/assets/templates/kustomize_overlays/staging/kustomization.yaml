@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: "{{APP_NAME}}-staging"
+
+resources:
+  - ../../kustomize_base
+
+replicas:
+  - name: "{{APP_NAME}}"
+    count: 2
+
+configMapGenerator:
+  - name: "{{APP_NAME}}-config"
+    behavior: merge
+    literals:
+      - APP_ENV=staging
+      - LOG_LEVEL=info
