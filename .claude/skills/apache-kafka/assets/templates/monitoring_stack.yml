@@ -1,0 +1,83 @@
+# Kafka Monitoring Stack — Prometheus + Grafana + JMX Exporter
+# Usage: docker compose -f monitoring_stack.yml up -d
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: kafka-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./alert-rules.yml:/etc/prometheus/alert-rules.yml
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: kafka-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "{{GRAFANA_PASSWORD}}"
+      GF_INSTALL_PLUGINS: grafana-clock-panel
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter
+    command:
+      - "--kafka.server={{KAFKA_BOOTSTRAP}}"
+      - "--topic.filter=.*"
+      - "--group.filter=.*"
+    ports:
+      - "9308:9308"
+
+volumes:
+  prometheus-data:
+  grafana-data:
+
+# --- prometheus.yml (create alongside this file) ---
+# global:
+#   scrape_interval: 15s
+#   evaluation_interval: 15s
+#
+# rule_files:
+#   - alert-rules.yml
+#
+# scrape_configs:
+#   - job_name: kafka-jmx
+#     static_configs:
+#       - targets: ['kafka-1:7071', 'kafka-2:7071', 'kafka-3:7071']
+#
+#   - job_name: kafka-exporter
+#     static_configs:
+#       - targets: ['kafka-exporter:9308']
+#
+#   - job_name: connect-jmx
+#     static_configs:
+#       - targets: ['connect:7072']
+
+# --- alert-rules.yml ---
+# groups:
+#   - name: kafka
+#     rules:
+#       - alert: KafkaUnderReplicatedPartitions
+#         expr: kafka_server_replica_manager_under_replicated_partitions > 0
+#         for: 5m
+#         labels: { severity: critical }
+#       - alert: KafkaConsumerLag
+#         expr: kafka_consumergroup_lag > 10000
+#         for: 10m
+#         labels: { severity: warning }
+#       - alert: KafkaBrokerDown
+#         expr: kafka_brokers < 3
+#         for: 1m
+#         labels: { severity: critical }

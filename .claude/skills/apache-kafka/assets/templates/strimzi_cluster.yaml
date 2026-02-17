@@ -1,0 +1,136 @@
+# Strimzi Kafka Cluster — KRaft Mode (Kubernetes)
+# Replace {{PLACEHOLDERS}} with your values.
+# kubectl apply -f strimzi_cluster.yaml -n kafka
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: controller
+  labels:
+    strimzi.io/cluster: "{{CLUSTER_NAME}}"
+spec:
+  replicas: 3
+  roles:
+    - controller
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 10Gi
+        class: "{{STORAGE_CLASS}}"
+        deleteClaim: false
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: broker
+  labels:
+    strimzi.io/cluster: "{{CLUSTER_NAME}}"
+spec:
+  replicas: 3
+  roles:
+    - broker
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 100Gi
+        class: "{{STORAGE_CLASS}}"
+        deleteClaim: false
+  resources:
+    requests:
+      memory: 4Gi
+      cpu: "2"
+    limits:
+      memory: 8Gi
+      cpu: "4"
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: "{{CLUSTER_NAME}}"
+  annotations:
+    strimzi.io/kraft: enabled
+    strimzi.io/node-pools: enabled
+spec:
+  kafka:
+    version: 3.9.0
+    metadataVersion: "3.9"
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+        authentication:
+          type: scram-sha-512
+      # Uncomment for external access
+      # - name: external
+      #   port: 9094
+      #   type: loadbalancer
+      #   tls: true
+      #   authentication:
+      #     type: scram-sha-512
+    config:
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      num.partitions: 6
+      log.retention.hours: 168
+      log.segment.bytes: 1073741824
+      auto.create.topics.enable: false
+      unclean.leader.election.enable: false
+      compression.type: producer
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics
+          key: kafka-metrics-config.yml
+  entityOperator:
+    topicOperator:
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: "0.1"
+        limits:
+          memory: 512Mi
+          cpu: "0.5"
+    userOperator:
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: "0.1"
+        limits:
+          memory: 512Mi
+          cpu: "0.5"
+---
+# Kafka User (SCRAM-SHA-512)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: "{{SERVICE_USER}}"
+  labels:
+    strimzi.io/cluster: "{{CLUSTER_NAME}}"
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: "{{TOPIC_PREFIX}}"
+          patternType: prefix
+        operations: [Read, Write, Describe, Create]
+      - resource:
+          type: group
+          name: "{{GROUP_PREFIX}}"
+          patternType: prefix
+        operations: [Read, Describe]

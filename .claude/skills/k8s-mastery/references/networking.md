@@ -551,6 +551,8 @@ spec:
 
 ### LoadBalancer
 
+#### AWS — Network Load Balancer (NLB)
+
 ```yaml
 apiVersion: v1
 kind: Service
@@ -561,8 +563,12 @@ metadata:
     service.beta.kubernetes.io/aws-load-balancer-type: nlb
     service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
     service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold: "2"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-unhealthy-threshold: "3"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval: "10"
 spec:
   type: LoadBalancer
+  externalTrafficPolicy: Local  # preserve client IP
   selector:
     app: api-gateway
   ports:
@@ -570,6 +576,220 @@ spec:
       port: 443
       targetPort: 8443
 ```
+
+#### AWS — Internal NLB (Private Services)
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: internal-api
+  namespace: production
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-subnets: "subnet-abc,subnet-def"
+spec:
+  type: LoadBalancer
+  selector:
+    app: internal-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+```
+
+#### GCP — Cloud Load Balancer
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: public-api
+  namespace: production
+  annotations:
+    cloud.google.com/l4-rbs: "enabled"                    # Regional Backend Service
+    cloud.google.com/neg: '{"ingress": true}'             # Network Endpoint Groups
+    networking.gke.io/load-balancer-type: "External"       # or "Internal"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: api-gateway
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+```
+
+#### GCP — Internal Load Balancer
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: internal-api
+  namespace: production
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
+    networking.gke.io/internal-load-balancer-subnet: "ilb-subnet"
+    networking.gke.io/internal-load-balancer-allow-global-access: "true"  # cross-region
+spec:
+  type: LoadBalancer
+  selector:
+    app: internal-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+```
+
+#### Azure — Standard Load Balancer
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: public-api
+  namespace: production
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-sku: "Standard"
+    service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path: "/healthz"
+    service.beta.kubernetes.io/azure-dns-label-name: "myapp"  # myapp.westus2.cloudapp.azure.com
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: api-gateway
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+```
+
+#### Azure — Internal Load Balancer
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: internal-api
+  namespace: production
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "internal-subnet"
+spec:
+  type: LoadBalancer
+  selector:
+    app: internal-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+```
+
+#### MetalLB — Bare-Metal Load Balancer
+
+MetalLB provides LoadBalancer services for bare-metal/on-prem clusters where no cloud LB exists.
+
+**Install MetalLB:**
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+```
+
+**IPAddressPool — Define IP range:**
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: production-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.1.200-192.168.1.250    # range allocation
+    - 10.0.0.100/32                   # single IP
+  autoAssign: true
+  avoidBuggyIPs: true                # skip .0 and .255
+```
+
+**L2Advertisement — Layer 2 mode (simple, no BGP):**
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: l2-advert
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - production-pool
+  interfaces:
+    - eth0                            # limit to specific interface
+```
+
+**BGPAdvertisement — BGP mode (production-grade routing):**
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: bgp-advert
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - production-pool
+  aggregationLength: 32
+  communities:
+    - 65535:65282                      # NO_EXPORT community
+---
+apiVersion: metallb.io/v1beta1
+kind: BGPPeer
+metadata:
+  name: router-peer
+  namespace: metallb-system
+spec:
+  myASN: 64500
+  peerASN: 64501
+  peerAddress: 10.0.0.1
+  keepaliveTime: 20s
+  holdTime: 60s
+  sourceAddress: 10.0.0.10
+```
+
+**Service using MetalLB:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: public-api
+  namespace: production
+  annotations:
+    metallb.universe.tf/address-pool: production-pool    # select specific pool
+    metallb.universe.tf/loadBalancerIPs: "192.168.1.200" # request specific IP
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: api-gateway
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+```
+
+#### LoadBalancer Cloud Annotations Quick Reference
+
+| Feature | AWS | GCP | Azure |
+|---------|-----|-----|-------|
+| **LB Type** | `aws-load-balancer-type: nlb` | `cloud.google.com/l4-rbs: enabled` | `azure-load-balancer-sku: Standard` |
+| **Internal** | `aws-load-balancer-scheme: internal` | `load-balancer-type: Internal` | `azure-load-balancer-internal: true` |
+| **Health check** | `healthcheck-interval: 10` | default NEG health checks | `health-probe-request-path: /healthz` |
+| **TLS at LB** | `aws-load-balancer-ssl-cert: arn:...` | Managed cert via Ingress/Gateway | Azure Key Vault integration |
+| **Client IP** | `externalTrafficPolicy: Local` | `externalTrafficPolicy: Local` | `externalTrafficPolicy: Local` |
+| **Subnet** | `aws-load-balancer-subnets: ...` | `internal-load-balancer-subnet: ...` | `azure-load-balancer-internal-subnet: ...` |
 
 ---
 

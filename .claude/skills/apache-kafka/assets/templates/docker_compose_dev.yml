@@ -1,0 +1,89 @@
+# Apache Kafka Dev Stack — KRaft Mode (No ZooKeeper)
+# Usage: docker compose -f docker_compose_dev.yml up -d
+# Tier 1: Single broker | Tier 2: Add replicas, security, monitoring
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"     # Client
+      - "9093:9093"     # Controller
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: "{{CLUSTER_ID}}"  # Generate: kafka-storage.sh random-uuid
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Uncomment for Tier 2+
+  # schema-registry:
+  #   image: confluentinc/cp-schema-registry:7.7.0
+  #   hostname: schema-registry
+  #   container_name: schema-registry
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+  #   ports:
+  #     - "8081:8081"
+  #   environment:
+  #     SCHEMA_REGISTRY_HOST_NAME: schema-registry
+  #     SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+  #     SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      # KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+
+  # Uncomment for monitoring (Tier 2+)
+  # prometheus:
+  #   image: prom/prometheus:v2.53.0
+  #   container_name: prometheus
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml
+  #     - prometheus-data:/prometheus
+
+  # grafana:
+  #   image: grafana/grafana:11.1.0
+  #   container_name: grafana
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     GF_SECURITY_ADMIN_PASSWORD: admin
+  #   volumes:
+  #     - grafana-data:/var/lib/grafana
+
+volumes:
+  kafka-data:
+  # prometheus-data:
+  # grafana-data:

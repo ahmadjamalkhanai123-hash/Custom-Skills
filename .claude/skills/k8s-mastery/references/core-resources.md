@@ -612,6 +612,8 @@ spec:
 
 ### LoadBalancer (external, cloud)
 
+#### AWS — NLB with TLS termination
+
 ```yaml
 apiVersion: v1
 kind: Service
@@ -624,6 +626,9 @@ metadata:
     service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
     service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:us-east-1:123456789:certificate/abc"
     service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold: "2"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-unhealthy-threshold: "3"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval: "10"
 spec:
   type: LoadBalancer
   externalTrafficPolicy: Local   # preserve client IP
@@ -634,6 +639,109 @@ spec:
       protocol: TCP
   selector:
     app.kubernetes.io/name: api-server
+```
+
+#### GCP — Regional Backend Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-public
+  namespace: payments
+  annotations:
+    cloud.google.com/l4-rbs: "enabled"
+    cloud.google.com/neg: '{"ingress": true}'
+    networking.gke.io/load-balancer-type: "External"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: https
+      port: 443
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: api-server
+```
+
+#### Azure — Standard Load Balancer
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-public
+  namespace: payments
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-sku: "Standard"
+    service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path: "/healthz"
+    service.beta.kubernetes.io/azure-dns-label-name: "payments-api"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: https
+      port: 443
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: api-server
+```
+
+#### MetalLB — Bare-Metal LoadBalancer
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-public
+  namespace: payments
+  annotations:
+    metallb.universe.tf/address-pool: "production-pool"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: https
+      port: 443
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: api-server
+```
+
+### Internal LoadBalancer (private, cross-VPC)
+
+```yaml
+# AWS Internal
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-internal
+  namespace: payments
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+---
+# GCP Internal
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-internal
+  namespace: payments
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
+    networking.gke.io/internal-load-balancer-allow-global-access: "true"
+---
+# Azure Internal
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-internal
+  namespace: payments
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
 ```
 
 ### NodePort (bare metal, testing)
@@ -675,10 +783,16 @@ spec:
 Is the service internal only?
   YES -> ClusterIP (default)
   NO  -> Needs external access?
-    Cloud LB available?
-      YES -> LoadBalancer (with NLB annotations)
-    Bare metal / testing?
-      YES -> NodePort
+    Cloud provider?
+      AWS   -> LoadBalancer (NLB annotations)
+      GCP   -> LoadBalancer (Regional Backend Service)
+      Azure -> LoadBalancer (Standard SKU)
+    Bare metal / on-prem?
+      MetalLB installed?
+        YES -> LoadBalancer (MetalLB pool)
+        NO  -> NodePort (30000-32767)
+    Private / cross-VPC?
+      YES -> Internal LoadBalancer (cloud-specific internal annotation)
     Pointing to external service?
       YES -> ExternalName
     Need stable DNS for StatefulSet pods?
