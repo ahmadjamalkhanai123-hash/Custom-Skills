@@ -1,0 +1,289 @@
+# GitLab CI Multi-Stage Pipeline — Tier 3 (Production)
+# Replace: {{APP_NAME}}, {{REGISTRY}}, {{K8S_NAMESPACE}}, {{HELM_CHART}}
+
+stages:
+  - quality
+  - test
+  - build
+  - scan
+  - deploy-staging
+  - test-staging
+  - deploy-production
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  APP_NAME: {{APP_NAME}}
+  HELM_CHART: {{HELM_CHART}}
+
+default:
+  image: python:3.12-slim
+  before_script:
+    - pip install -q -r requirements-dev.txt
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  interruptible: true  # Cancel superseded pipeline jobs
+
+# ───────────────────────────────────────
+# TEMPLATES (reusable with extends:)
+# ───────────────────────────────────────
+.python-cache:
+  cache:
+    key:
+      files:
+        - requirements*.txt
+        - pyproject.toml
+    paths:
+      - .cache/pip
+      - .venv/
+
+.docker-build:
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+
+.k8s-deploy:
+  image: alpine/helm:3.15
+  before_script:
+    - kubectl config set-cluster k8s --server="$K8S_SERVER"
+    - kubectl config set-credentials admin --token="$K8S_TOKEN"
+    - kubectl config set-context default --cluster=k8s --user=admin
+    - kubectl config use-context default
+
+# ───────────────────────────────────────
+# STAGE 1: Quality (parallel)
+# ───────────────────────────────────────
+lint:
+  extends: .python-cache
+  stage: quality
+  script:
+    - flake8 src/ --max-line-length=120
+    - mypy src/ --strict
+    - black --check src/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+secret-detection:
+  stage: quality
+  image: zricethezav/gitleaks:latest
+  before_script: []
+  script:
+    - gitleaks detect --source . --verbose
+  allow_failure: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+sast:
+  stage: quality
+  image: returntocorp/semgrep:latest
+  before_script: []
+  script:
+    - semgrep --config "p/owasp-top-ten" --config "p/python" src/
+      --json --output semgrep-results.json
+      --error
+  artifacts:
+    reports:
+      sast: semgrep-results.json
+    paths:
+      - semgrep-results.json
+    expire_in: 1 week
+
+dependency-scan:
+  stage: quality
+  script:
+    - pip install safety
+    - safety check -r requirements.txt --full-report
+  allow_failure: false
+
+# ───────────────────────────────────────
+# STAGE 2: Test
+# ───────────────────────────────────────
+unit-tests:
+  extends: .python-cache
+  stage: test
+  services:
+    - postgres:16-alpine
+    - redis:7-alpine
+  variables:
+    POSTGRES_DB: testdb
+    POSTGRES_USER: testuser
+    POSTGRES_PASSWORD: testpass
+    DATABASE_URL: "postgresql://testuser:testpass@postgres/testdb"
+    REDIS_URL: "redis://redis:6379"
+  script:
+    - pytest tests/unit tests/integration
+        --cov=src
+        --cov-report=term-missing
+        --cov-report=xml:coverage.xml
+        --cov-fail-under=80
+        --junitxml=reports/test-results.xml
+        -v
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    when: always
+    reports:
+      junit: reports/test-results.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths:
+      - coverage.xml
+      - reports/
+    expire_in: 1 week
+
+# ───────────────────────────────────────
+# STAGE 3: Build
+# ───────────────────────────────────────
+build-image:
+  extends: .docker-build
+  stage: build
+  needs: [unit-tests]
+  script:
+    - docker build
+        --cache-from $CI_REGISTRY_IMAGE:cache
+        --build-arg GIT_SHA=$CI_COMMIT_SHA
+        --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        --tag $IMAGE_TAG
+        --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+        .
+    - docker push $IMAGE_TAG
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+    # Update cache image
+    - docker tag $IMAGE_TAG $CI_REGISTRY_IMAGE:cache
+    - docker push $CI_REGISTRY_IMAGE:cache
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+
+# ───────────────────────────────────────
+# STAGE 4: Scan
+# ───────────────────────────────────────
+container-scan:
+  extends: .docker-build
+  stage: scan
+  needs: [build-image]
+  script:
+    - docker pull aquasec/trivy:latest
+    - docker run --rm
+        -v /var/run/docker.sock:/var/run/docker.sock
+        aquasec/trivy:latest image
+        --exit-code 1
+        --severity CRITICAL,HIGH
+        --ignore-unfixed
+        --format json
+        --output trivy-results.json
+        $IMAGE_TAG
+  artifacts:
+    when: always
+    paths:
+      - trivy-results.json
+    expire_in: 1 week
+  allow_failure: false
+
+# ───────────────────────────────────────
+# STAGE 5: Deploy Staging
+# ───────────────────────────────────────
+deploy-staging:
+  extends: .k8s-deploy
+  stage: deploy-staging
+  needs: [container-scan, dependency-scan]
+  environment:
+    name: staging
+    url: https://staging.$APP_NAME.example.com
+  script:
+    - helm upgrade --install $APP_NAME $HELM_CHART
+        --namespace {{K8S_NAMESPACE}}-staging
+        --create-namespace
+        --set image.tag=$CI_COMMIT_SHA
+        --values chart/values-staging.yaml
+        --atomic
+        --timeout 5m
+        --wait
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ───────────────────────────────────────
+# STAGE 6: Test Staging (DAST + Smoke)
+# ───────────────────────────────────────
+smoke-test-staging:
+  stage: test-staging
+  needs: [deploy-staging]
+  script:
+    - apt-get update -qq && apt-get install -y -qq curl jq
+    - ./scripts/smoke_test.sh https://staging.$APP_NAME.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+dast-scan:
+  stage: test-staging
+  needs: [deploy-staging]
+  image: ghcr.io/zaproxy/zaproxy:stable
+  before_script: []
+  script:
+    - zap-baseline.py
+        -t https://staging.$APP_NAME.example.com
+        -r zap-report.html
+        -x zap-report.xml
+        -J zap-report.json
+        -l WARN    # Don't fail on warnings, only alerts
+  artifacts:
+    when: always
+    paths:
+      - zap-report.*
+    expire_in: 1 week
+  allow_failure: true  # Warn but don't block (use 'false' for full block)
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ───────────────────────────────────────
+# STAGE 7: Deploy Production (manual)
+# ───────────────────────────────────────
+deploy-production:
+  extends: .k8s-deploy
+  stage: deploy-production
+  needs: [smoke-test-staging]
+  environment:
+    name: production
+    url: https://$APP_NAME.example.com
+  when: manual    # Requires human approval
+  script:
+    - helm upgrade --install $APP_NAME $HELM_CHART
+        --namespace {{K8S_NAMESPACE}}
+        --set image.tag=$CI_COMMIT_SHA
+        --values chart/values-production.yaml
+        --atomic
+        --timeout 10m
+    - ./scripts/smoke_test.sh https://$APP_NAME.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+
+notify-failure:
+  stage: deploy-production
+  when: on_failure
+  script:
+    - |
+      curl -X POST "$SLACK_WEBHOOK_URL" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"text\": \"🚨 Pipeline failed: $CI_PROJECT_NAME\",
+          \"attachments\": [{
+            \"color\": \"danger\",
+            \"fields\": [
+              {\"title\": \"Branch\", \"value\": \"$CI_COMMIT_BRANCH\"},
+              {\"title\": \"SHA\", \"value\": \"$CI_COMMIT_SHORT_SHA\"},
+              {\"title\": \"Pipeline\", \"value\": \"$CI_PIPELINE_URL\"},
+              {\"title\": \"By\", \"value\": \"$GITLAB_USER_LOGIN\"}
+            ]
+          }]
+        }"
+  needs: []

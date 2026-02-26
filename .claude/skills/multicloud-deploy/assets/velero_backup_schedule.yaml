@@ -1,0 +1,225 @@
+# Velero Backup Schedule — Multi-Cloud DR Configuration
+# Deploy on each cluster; backups target cross-cloud storage
+
+---
+# BackupStorageLocation: AWS S3 (primary)
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: aws-s3-primary
+  namespace: velero
+spec:
+  provider: aws
+  objectStorage:
+    bucket: velero-backups-prod
+    prefix: "cluster-aws-eks/"
+  config:
+    region: us-east-1
+    s3ForcePathStyle: "false"
+    serverSideEncryption: aws:kms
+    kmsKeyId: "arn:aws:kms:us-east-1:ACCOUNT:key/KEY_ID"
+  credential:
+    name: velero-aws-credentials
+    key: cloud
+  accessMode: ReadWrite
+  default: true
+
+---
+# BackupStorageLocation: GCS (cross-cloud DR copy)
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: gcs-dr
+  namespace: velero
+spec:
+  provider: gcp
+  objectStorage:
+    bucket: velero-dr-backups-prod
+    prefix: "cross-cloud/"
+  config:
+    serviceAccount: velero@gcp-project.iam.gserviceaccount.com
+  accessMode: ReadWrite
+
+---
+# VolumeSnapshotLocation: AWS EBS
+apiVersion: velero.io/v1
+kind: VolumeSnapshotLocation
+metadata:
+  name: aws-ebs-snapshots
+  namespace: velero
+spec:
+  provider: aws
+  config:
+    region: us-east-1
+
+---
+# Schedule: Daily full backup of all production namespaces
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: daily-production-backup
+  namespace: velero
+  labels:
+    backup-type: daily
+    tier: production
+spec:
+  schedule: "0 2 * * *"    # 2 AM UTC daily
+  useOwnerReferencesInBackup: false
+  paused: false
+
+  template:
+    ttl: 720h               # 30-day retention
+    storageLocation: aws-s3-primary
+
+    includedNamespaces:
+      - payments
+      - orders
+      - users
+      - inventory
+      - notifications
+
+    excludedResources:
+      - events
+      - events.events.k8s.io
+      - backups.velero.io
+      - restores.velero.io
+      - resticrepositories.velero.io
+
+    includeClusterResources: true
+    defaultVolumesToFsBackup: false    # use EBS snapshots (faster)
+
+    volumeSnapshotLocations:
+      - aws-ebs-snapshots
+
+    labelSelector:
+      matchExpressions:
+        - key: backup
+          operator: NotIn
+          values: ["skip"]
+
+    hooks:
+      resources:
+        # Pre-backup: PostgreSQL checkpoint
+        - name: postgres-checkpoint
+          includedNamespaces: [payments, orders]
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+          pre:
+            - exec:
+                container: postgresql
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    psql -U postgres -c "CHECKPOINT;" && \
+                    psql -U postgres -c "SELECT pg_start_backup('velero', false, false);"
+                onError: Fail
+                timeout: 60s
+          post:
+            - exec:
+                container: postgresql
+                command:
+                  - /bin/bash
+                  - -c
+                  - "psql -U postgres -c \"SELECT pg_stop_backup(false, true);\""
+                onError: Continue
+                timeout: 60s
+
+---
+# Schedule: Hourly incremental for critical payment namespace
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: hourly-payments-backup
+  namespace: velero
+  labels:
+    backup-type: hourly
+    tier: critical
+spec:
+  schedule: "0 * * * *"    # every hour
+  template:
+    ttl: 48h               # 48-hour retention
+    storageLocation: aws-s3-primary
+    includedNamespaces: [payments]
+    defaultVolumesToFsBackup: false
+
+---
+# Schedule: Weekly backup to cross-cloud GCS (DR copy)
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: weekly-cross-cloud-dr
+  namespace: velero
+  labels:
+    backup-type: weekly-dr
+spec:
+  schedule: "0 3 * * 0"    # 3 AM UTC Sunday
+  template:
+    ttl: 2160h              # 90-day retention for DR copy
+    storageLocation: gcs-dr
+    includedNamespaces:
+      - payments
+      - orders
+      - users
+    includeClusterResources: true
+
+---
+# Backup verification CronJob (runs monthly restore test)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-verify
+  namespace: velero
+spec:
+  schedule: "0 6 1 * *"    # 6 AM UTC, 1st of each month
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: velero-verify
+          restartPolicy: OnFailure
+          containers:
+            - name: verify
+              image: velero/velero:latest
+              env:
+                - name: BACKUP_NAME
+                  value: ""    # auto-detect latest
+                - name: TEST_NAMESPACE
+                  value: "verify-restore"
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  # Get latest backup name
+                  LATEST=$(velero backup get --output=json | \
+                    jq -r '[.items[] | select(.status.phase=="Completed")] | \
+                    sort_by(.metadata.creationTimestamp) | last | .metadata.name')
+
+                  echo "Restoring backup: $LATEST to namespace: $TEST_NAMESPACE"
+
+                  # Create isolated test namespace
+                  kubectl create namespace $TEST_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+
+                  # Restore to test namespace
+                  velero restore create verify-$(date +%Y%m%d) \
+                    --from-backup $LATEST \
+                    --include-namespaces payments \
+                    --namespace-mappings payments:$TEST_NAMESPACE \
+                    --restore-volumes=false \
+                    --wait
+
+                  # Verify deployment exists
+                  kubectl get deployment checkout-api -n $TEST_NAMESPACE
+                  RESULT=$?
+
+                  # Cleanup
+                  kubectl delete namespace $TEST_NAMESPACE
+
+                  if [ $RESULT -eq 0 ]; then
+                    echo "Backup verification PASSED"
+                    exit 0
+                  else
+                    echo "Backup verification FAILED"
+                    exit 1
+                  fi

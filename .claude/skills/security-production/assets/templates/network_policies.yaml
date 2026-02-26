@@ -1,0 +1,219 @@
+---
+# Network Policy Templates — Zero-Trust Kubernetes Networking
+# Apply in order: 1) default-deny-all 2) allow-dns 3) service-specific allows
+
+# === 1. Default Deny All (apply to EVERY namespace) ===
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: MY_NAMESPACE
+  labels:
+    policy-type: baseline
+    security-tier: zero-trust
+spec:
+  podSelector: {}        # Matches ALL pods in namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  # No rules = deny everything
+
+---
+# === 2. Allow DNS (required for service discovery) ===
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: MY_NAMESPACE
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+---
+# === 3. Allow Prometheus Metrics Scraping ===
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-ingress
+  namespace: MY_NAMESPACE
+spec:
+  podSelector:
+    matchLabels:
+      prometheus.io/scrape: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
+          protocol: TCP
+        - port: 8080      # Some apps expose /metrics on main port
+          protocol: TCP
+
+---
+# === 4. Application-Specific Policy Template ===
+# Replace: MY_APP, SOURCE_APP, SOURCE_NAMESPACE, MY_PORT, DB_NAMESPACE, DB_PORT
+
+# MY_APP: allow ingress from SOURCE_APP only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: MY_APP-allow-ingress
+  namespace: MY_NAMESPACE
+spec:
+  podSelector:
+    matchLabels:
+      app: MY_APP
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: SOURCE_NAMESPACE
+          podSelector:
+            matchLabels:
+              app: SOURCE_APP
+      ports:
+        - port: MY_PORT
+          protocol: TCP
+
+---
+# MY_APP: allow egress to database only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: MY_APP-allow-db-egress
+  namespace: MY_NAMESPACE
+spec:
+  podSelector:
+    matchLabels:
+      app: MY_APP
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: DB_NAMESPACE
+          podSelector:
+            matchLabels:
+              app: postgres   # or mysql, redis, etc.
+      ports:
+        - port: DB_PORT   # 5432 (Postgres), 3306 (MySQL), 6379 (Redis)
+          protocol: TCP
+
+---
+# === 5. Allow External HTTPS (for cloud API calls) ===
+# Only for pods that need external internet access (LLM APIs, etc.)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-external-https
+  namespace: MY_NAMESPACE
+spec:
+  podSelector:
+    matchLabels:
+      external-access: "true"     # Label pods that need external access
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 443
+          protocol: TCP
+    - ports:
+        - port: 53
+          protocol: UDP
+
+---
+# === 6. Vault Agent Sidecar Access ===
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-vault-egress
+  namespace: MY_NAMESPACE
+spec:
+  podSelector:
+    matchLabels:
+      vault.hashicorp.com/agent-inject: "true"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault
+      ports:
+        - port: 8200
+          protocol: TCP
+
+---
+# === 7. Falco Monitoring Access (read-only) ===
+# Allow Falco DaemonSet in security namespace to receive events
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-falco-egress
+  namespace: security
+spec:
+  podSelector:
+    matchLabels:
+      app: falco
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 9200    # Elasticsearch
+          protocol: TCP
+        - port: 2801    # Falcosidekick
+          protocol: TCP
+        - port: 443     # HTTPS (Slack, PagerDuty webhooks)
+          protocol: TCP
+        - port: 53
+          protocol: UDP
+
+---
+# === 8. AI Agent Restricted Network Access ===
+# AI agents should ONLY reach their designated LLM proxy
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-agent-network-isolation
+  namespace: agents
+spec:
+  podSelector:
+    matchLabels:
+      workload-type: ai-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orchestrator
+      ports:
+        - port: 8080
+  egress:
+    - to:   # Only LLM proxy
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: llm-gateway
+          podSelector:
+            matchLabels:
+              app: llm-proxy
+      ports:
+        - port: 443
+    - ports:    # DNS
+        - port: 53
+          protocol: UDP

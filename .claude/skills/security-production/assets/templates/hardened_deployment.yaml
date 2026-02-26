@@ -1,0 +1,203 @@
+---
+# Hardened Deployment Template — PSS Restricted Compliant
+# Satisfies: CIS K8s Benchmark, NIST 800-190, SOC 2 CC6.3
+# Replace: MY_APP, MY_NAMESPACE, MY_IMAGE, MEMORY_LIMIT, CPU_LIMIT
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: MY_APP
+  namespace: MY_NAMESPACE
+  labels:
+    app: MY_APP
+    security-tier: production
+automountServiceAccountToken: false    # Disable automount; use projected token
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: MY_APP
+  namespace: MY_NAMESPACE
+  labels:
+    app: MY_APP
+    version: "1.0.0"
+    team: platform
+    cost-center: "1234"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: MY_APP
+  template:
+    metadata:
+      labels:
+        app: MY_APP
+        version: "1.0.0"
+      annotations:
+        # AppArmor profile (Tier 2+)
+        container.apparmor.security.beta.kubernetes.io/MY_APP: runtime/default
+        # Prometheus scraping
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: MY_APP
+      automountServiceAccountToken: false
+
+      # Security context for the pod
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534           # nobody
+        runAsGroup: 65534
+        fsGroup: 65534
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault     # Tier 3+: use Localhost with custom profile
+
+      # Topology spread for availability
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: MY_APP
+
+      # No privilege escalation via node affinity
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: [linux]
+                  - key: node-restriction/public-workload
+                    operator: DoesNotExist   # Don't schedule on bastion/admin nodes
+
+      containers:
+        - name: MY_APP
+          image: ghcr.io/myorg/MY_APP@sha256:DIGEST_HERE   # PINNED TO DIGEST
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+          # Container security context (PSS Restricted)
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities:
+              drop: ["ALL"]
+              # add: ["NET_BIND_SERVICE"]  # Only if port < 1024
+
+          # Resources: always set for production
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "MEMORY_LIMIT"   # e.g. 512Mi
+              cpu: "CPU_LIMIT"         # e.g. 1000m
+
+          # Liveness and readiness probes
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+
+          # Environment: no secrets here — use volumeMounts from Vault/ESO
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+
+          # Volume mounts: tmpfs for writable paths, secrets from Vault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /app/cache
+            - name: vault-secrets
+              mountPath: /vault/secrets
+              readOnly: true
+            # Projected ServiceAccount token (explicit, short-lived)
+            - name: token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+
+      # Volumes
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory    # tmpfs: data doesn't persist to disk
+            sizeLimit: 100Mi
+        - name: cache
+          emptyDir:
+            sizeLimit: 500Mi
+        - name: vault-secrets
+          emptyDir:
+            medium: Memory    # Vault agent writes secrets to memory-backed tmpfs
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600    # 1-hour token rotation
+                  audience: my-service
+
+      # Graceful termination
+      terminationGracePeriodSeconds: 30
+
+---
+# PodDisruptionBudget: maintain availability during rolling updates
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: MY_APP-pdb
+  namespace: MY_NAMESPACE
+spec:
+  minAvailable: 2     # Always keep at least 2 pods running
+  selector:
+    matchLabels:
+      app: MY_APP

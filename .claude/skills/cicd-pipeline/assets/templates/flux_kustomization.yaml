@@ -1,0 +1,356 @@
+# Flux CD v2 — GitOps Kustomization + Image Automation
+# Replace: {{APP_NAME}}, {{GITOPS_REPO_URL}}, {{REGISTRY}}, {{TARGET_NAMESPACE}},
+#          {{SLACK_WEBHOOK_SECRET}}
+# Apply: kubectl apply -f flux_kustomization.yaml -n flux-system
+
+---
+# GitRepository — Source definition pointing to GitOps repo
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: {{APP_NAME}}-gitops
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: {{GITOPS_REPO_URL}}
+  ref:
+    branch: main
+  secretRef:
+    name: gitops-ssh-key     # SSH deploy key for private repo
+  # Ignore files that don't affect K8s manifests
+  ignore: |
+    /.github/
+    /docs/
+    *.md
+
+---
+# Kustomization — Staging Environment
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: {{APP_NAME}}-staging
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/name: {{APP_NAME}}
+    environment: staging
+spec:
+  interval: 5m
+  retryInterval: 1m
+  timeout: 3m
+  prune: true              # Delete resources removed from Git
+  wait: true               # Wait for health checks to pass
+  sourceRef:
+    kind: GitRepository
+    name: {{APP_NAME}}-gitops
+  path: ./apps/{{APP_NAME}}/overlays/staging
+
+  # Health checks — Flux waits for these before marking ready
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: {{APP_NAME}}
+      namespace: {{TARGET_NAMESPACE}}-staging
+
+  # Post-sync notifications (requires fluxcd/notification-controller)
+  postBuild:
+    substitute:
+      ENVIRONMENT: staging
+      APP_VERSION: latest
+
+  # Force apply even if objects are not managed by Flux (use carefully)
+  force: false
+
+---
+# Kustomization — Production Environment
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: {{APP_NAME}}-production
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/name: {{APP_NAME}}
+    environment: production
+spec:
+  interval: 10m
+  retryInterval: 2m
+  timeout: 5m
+  prune: true
+  wait: true
+  sourceRef:
+    kind: GitRepository
+    name: {{APP_NAME}}-gitops
+  path: ./apps/{{APP_NAME}}/overlays/production
+
+  # Suspend: set to true to pause all reconciliation
+  suspend: false
+
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: {{APP_NAME}}
+      namespace: {{TARGET_NAMESPACE}}
+
+  postBuild:
+    substitute:
+      ENVIRONMENT: production
+
+  # Dependency: staging must be healthy before production reconciles
+  dependsOn:
+    - name: {{APP_NAME}}-staging
+
+---
+# OCIRepository — Pull images directly from OCI registry (alternative to GitRepository)
+# Use for Helm charts stored as OCI artifacts
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: OCIRepository
+metadata:
+  name: {{APP_NAME}}-helm-chart
+  namespace: flux-system
+spec:
+  interval: 5m
+  url: oci://{{REGISTRY}}/helm/{{APP_NAME}}
+  ref:
+    semver: '>=1.0.0'
+  secretRef:
+    name: registry-credentials
+  provider: aws    # aws | azure | gcp | generic
+
+---
+# HelmRelease — Manages Helm chart deployment via Flux
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: {{APP_NAME}}
+  namespace: {{TARGET_NAMESPACE}}-staging
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: {{APP_NAME}}
+      sourceRef:
+        kind: OCIRepository
+        name: {{APP_NAME}}-helm-chart
+        namespace: flux-system
+      interval: 1m
+
+  # Value overrides — merged with chart defaults
+  values:
+    replicaCount: 2
+    image:
+      repository: {{REGISTRY}}/{{APP_NAME}}
+      pullPolicy: IfNotPresent
+
+  # Per-environment value overrides (loads from Git)
+  valuesFrom:
+    - kind: ConfigMap
+      name: {{APP_NAME}}-staging-values
+      valuesKey: values.yaml
+    - kind: Secret
+      name: {{APP_NAME}}-staging-secrets
+      valuesKey: secret-values.yaml
+      optional: true
+
+  # Upgrade settings
+  upgrade:
+    remediation:
+      remediateLastFailure: true
+      retries: 3
+    cleanupOnFail: true
+    crds: CreateReplace
+
+  # Rollback on failure
+  rollback:
+    timeout: 5m
+    cleanupOnFail: true
+
+  # Test release after upgrade
+  test:
+    enable: true
+    ignoreFailures: false
+
+  # Drift detection — reconcile if values change externally
+  driftDetection:
+    mode: enabled
+    ignore:
+      - paths: ['/spec/replicas']  # HPA manages replicas
+        target:
+          kind: Deployment
+
+---
+# ImageRepository — Watch registry for new image tags
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImageRepository
+metadata:
+  name: {{APP_NAME}}
+  namespace: flux-system
+spec:
+  image: {{REGISTRY}}/{{APP_NAME}}
+  interval: 1m
+  secretRef:
+    name: registry-credentials
+
+  # Exclude tags matching these patterns
+  exclusionList:
+    - '^latest$'
+    - '^cache$'
+    - '.*-debug$'
+
+---
+# ImagePolicy — Determine which image tag to use
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImagePolicy
+metadata:
+  name: {{APP_NAME}}-staging
+  namespace: flux-system
+spec:
+  imageRepositoryRef:
+    name: {{APP_NAME}}
+  filterTags:
+    # Only track tags from main branch (format: sha-<commit>)
+    pattern: '^main-[a-f0-9]+-(?P<ts>[0-9]+)'
+    extract: '$ts'
+  policy:
+    numerical:
+      order: asc   # Latest timestamp wins
+
+---
+# ImagePolicy — Production: semver tags only (e.g., v1.2.3)
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImagePolicy
+metadata:
+  name: {{APP_NAME}}-production
+  namespace: flux-system
+spec:
+  imageRepositoryRef:
+    name: {{APP_NAME}}
+  filterTags:
+    pattern: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+  policy:
+    semver:
+      range: '>=1.0.0'
+
+---
+# ImageUpdateAutomation — Auto-commit new image tags to Git
+apiVersion: image.toolkit.fluxcd.io/v1beta1
+kind: ImageUpdateAutomation
+metadata:
+  name: {{APP_NAME}}-staging
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: {{APP_NAME}}-gitops
+    namespace: flux-system
+
+  git:
+    checkout:
+      ref:
+        branch: main
+    commit:
+      author:
+        name: Flux Image Updater
+        email: flux@example.com
+      messageTemplate: |
+        ci: update {{APP_NAME}} staging image to {{ .NewValue }}
+
+        Updated by: Flux ImageUpdateAutomation
+        Policy: {{APP_NAME}}-staging
+    push:
+      branch: main
+
+  # Only update files in staging overlay
+  update:
+    strategy: Setters
+    path: ./apps/{{APP_NAME}}/overlays/staging
+
+---
+# Alert — Notify Slack on Flux events
+apiVersion: notification.toolkit.fluxcd.io/v1beta3
+kind: Alert
+metadata:
+  name: {{APP_NAME}}-alerts
+  namespace: flux-system
+spec:
+  summary: '{{APP_NAME}} Flux Alert'
+  providerRef:
+    name: slack-provider
+  eventSeverity: info    # info | error
+  eventSources:
+    - kind: Kustomization
+      name: {{APP_NAME}}-staging
+      namespace: flux-system
+    - kind: Kustomization
+      name: {{APP_NAME}}-production
+      namespace: flux-system
+    - kind: HelmRelease
+      name: {{APP_NAME}}
+      namespace: {{TARGET_NAMESPACE}}-staging
+
+---
+# Provider — Slack notification provider
+apiVersion: notification.toolkit.fluxcd.io/v1beta3
+kind: Provider
+metadata:
+  name: slack-provider
+  namespace: flux-system
+spec:
+  type: slack
+  channel: '#deployments'
+  secretRef:
+    name: slack-webhook     # Secret: key=address, value=<slack-webhook-url>
+
+---
+# Receiver — Accept webhook from GitHub to trigger immediate reconciliation
+apiVersion: notification.toolkit.fluxcd.io/v1
+kind: Receiver
+metadata:
+  name: github-receiver
+  namespace: flux-system
+spec:
+  type: github
+  events:
+    - push
+  secretRef:
+    name: github-webhook-token
+  resources:
+    - apiVersion: source.toolkit.fluxcd.io/v1
+      kind: GitRepository
+      name: {{APP_NAME}}-gitops
+      namespace: flux-system
+
+# ─────────────────────────────────────────────────────────────
+# GitOps Repository Structure
+# ─────────────────────────────────────────────────────────────
+# apps/
+#   myapp/
+#     base/                    # Common manifests
+#       kustomization.yaml
+#       deployment.yaml
+#       service.yaml
+#       hpa.yaml
+#     overlays/
+#       staging/
+#         kustomization.yaml   # Inherits base, patches for staging
+#         patch-replicas.yaml
+#         # Image tag with Flux marker:
+#         # image: registry.example.com/myapp:latest # {"$imagepolicy": "flux-system:myapp-staging"}
+#       production/
+#         kustomization.yaml   # Inherits base, patches for production
+#         patch-replicas.yaml
+#         # image: registry.example.com/myapp:v1.2.3 # {"$imagepolicy": "flux-system:myapp-production"}
+
+# ─────────────────────────────────────────────────────────────
+# Bootstrap Flux (one-time setup)
+# ─────────────────────────────────────────────────────────────
+# flux bootstrap github \
+#   --owner=<org> \
+#   --repository=<gitops-repo> \
+#   --branch=main \
+#   --path=clusters/production \
+#   --personal=false \
+#   --token-auth=false  # Uses SSH key
+#
+# Verify:
+# flux get all -A
+# flux logs --level=error -A

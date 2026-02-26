@@ -1,0 +1,215 @@
+# Authorizer Base RBAC — Production Template
+# Replace: <NAMESPACE>, <TEAM>, <APP_NAME>, <OIDC_GROUP>
+# Usage: kubectl apply -f rbac_base.yaml
+
+---
+# ============================================================
+# 1. ServiceAccount — one per workload, no auto-mount
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: <APP_NAME>-sa
+  namespace: <NAMESPACE>
+  labels:
+    app.kubernetes.io/name: <APP_NAME>
+    app.kubernetes.io/component: service-account
+    rbac.authorizer.io/managed: "true"
+    team: <TEAM>
+  annotations:
+    rbac.authorizer.io/owner: "<TEAM>@company.com"
+    rbac.authorizer.io/purpose: "<APP_NAME> workload identity"
+    # Uncomment for AWS EKS IRSA:
+    # eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/<APP_NAME>-role"
+    # Uncomment for GKE Workload Identity:
+    # iam.gke.io/gcp-service-account: "<APP_NAME>@PROJECT_ID.iam.gserviceaccount.com"
+    # Uncomment for Azure Workload Identity:
+    # azure.workload.identity/client-id: "AZURE_CLIENT_ID"
+automountServiceAccountToken: false
+
+---
+# ============================================================
+# 2. Role — namespace-scoped, least-privilege
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: authorizer:<TEAM>:<APP_NAME>-operator
+  namespace: <NAMESPACE>
+  labels:
+    rbac.authorizer.io/tier: "application"
+    rbac.authorizer.io/team: "<TEAM>"
+    rbac.authorizer.io/managed: "true"
+rules:
+  # Read own pods and services
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  # Read config (no write — changes go through GitOps)
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  # Read own secrets by name (specify exact secretName below)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["<APP_NAME>-config", "<APP_NAME>-tls"]
+    verbs: ["get"]
+  # Manage own deployments (for health-based scaling hooks)
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["<APP_NAME>"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ============================================================
+# 3. RoleBinding — SA to Role in namespace
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bind-<APP_NAME>-sa
+  namespace: <NAMESPACE>
+  labels:
+    rbac.authorizer.io/managed: "true"
+subjects:
+  - kind: ServiceAccount
+    name: <APP_NAME>-sa
+    namespace: <NAMESPACE>
+roleRef:
+  kind: Role
+  name: authorizer:<TEAM>:<APP_NAME>-operator
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ============================================================
+# 4. ClusterRole — read-only viewer for human users (aggregate)
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: authorizer:<TEAM>:viewer
+  labels:
+    rbac.authorizer.io/tier: "human-viewer"
+    rbac.authorizer.io/team: "<TEAM>"
+    rbac.authorizer.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "configmaps", "endpoints", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ============================================================
+# 5. ClusterRole — namespace developer (deploy within ns)
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: authorizer:<TEAM>:namespace-developer
+  labels:
+    rbac.authorizer.io/tier: "human-developer"
+    rbac.authorizer.io/team: "<TEAM>"
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "configmaps", "endpoints", "events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # Read-only on secrets — devs use ExternalSecrets
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+  # NO: pods/exec, pods/portforward (security boundary)
+
+---
+# ============================================================
+# 6. RoleBinding — Group of humans in namespace
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bind-<OIDC_GROUP>-developers
+  namespace: <NAMESPACE>
+  labels:
+    rbac.authorizer.io/managed: "true"
+subjects:
+  - kind: Group
+    name: "oidc:<OIDC_GROUP>"    # OIDC groups claim value
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: authorizer:<TEAM>:namespace-developer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ============================================================
+# 7. NetworkPolicy — default deny + workload allow
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: <NAMESPACE>
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-<APP_NAME>-ingress
+  namespace: <NAMESPACE>
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: <APP_NAME>
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+    # Internal services
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              team: <TEAM>
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 5432
+          protocol: TCP

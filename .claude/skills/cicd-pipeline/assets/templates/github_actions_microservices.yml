@@ -1,0 +1,247 @@
+# GitHub Actions — Microservices Matrix Build (Tier 4)
+# Monorepo: detect changed services, build only affected, deploy via GitOps
+# Replace: {{REGISTRY}}, {{ORG}}, {{GITOPS_REPO}}
+
+name: Microservices CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+
+env:
+  REGISTRY: {{REGISTRY}}
+
+jobs:
+  # ─────────────────────────────────────────────────────
+  # DETECT which services changed
+  # ─────────────────────────────────────────────────────
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      changed-services: ${{ steps.filter.outputs.changes }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      any-changed: ${{ steps.filter.outputs.any-changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Detect changed paths per service
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            auth:
+              - 'services/auth/**'
+              - 'shared/proto/**'
+              - 'shared/libs/**'
+            orders:
+              - 'services/orders/**'
+              - 'shared/proto/**'
+              - 'shared/libs/**'
+            payments:
+              - 'services/payments/**'
+              - 'shared/**'
+            notifications:
+              - 'services/notifications/**'
+            api-gateway:
+              - 'services/api-gateway/**'
+              - 'shared/**'
+
+      # Build matrix from changed services
+      - name: Set Build Matrix
+        id: set-matrix
+        run: |
+          SERVICES='${{ steps.filter.outputs.changes }}'
+          echo "matrix={\"service\":${SERVICES}}" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────────────
+  # BUILD changed services (parallel matrix)
+  # ─────────────────────────────────────────────────────
+  build-services:
+    name: Build ${{ matrix.service }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.any-changed == 'true'
+    strategy:
+      fail-fast: false   # Show ALL failures, not just first
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: {{REGISTRY}}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Tests (${{ matrix.service }})
+        working-directory: services/${{ matrix.service }}
+        run: |
+          pip install -r requirements-dev.txt
+          pytest tests/ --cov=src --cov-fail-under=80 -v
+
+      - name: Secret Scan (${{ matrix.service }})
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: .gitleaks.toml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push ${{ matrix.service }}
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: services/${{ matrix.service }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.REGISTRY }}/{{ORG}}/${{ matrix.service }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/{{ORG}}/${{ matrix.service }}:${{ github.ref_name }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+
+      - name: Scan Image (${{ matrix.service }})
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/{{ORG}}/${{ matrix.service }}:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+  # ─────────────────────────────────────────────────────
+  # INTEGRATION TESTS (all services together)
+  # ─────────────────────────────────────────────────────
+  integration-tests:
+    name: Integration Tests
+    needs: [detect-changes, build-services]
+    if: needs.detect-changes.outputs.any-changed == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k3d
+        run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+      - name: Create k3d Cluster
+        run: k3d cluster create integration --agents 2 --wait --timeout 60s
+
+      - name: Load Service Images
+        run: |
+          for SERVICE in $(echo '${{ needs.detect-changes.outputs.changed-services }}' | jq -r '.[]'); do
+            docker pull ${{ env.REGISTRY }}/{{ORG}}/${SERVICE}:${{ github.sha }}
+            k3d image import ${{ env.REGISTRY }}/{{ORG}}/${SERVICE}:${{ github.sha }} -c integration
+          done
+
+      - name: Deploy Integration Stack
+        run: |
+          kubectl apply -f tests/integration/k8s/
+          kubectl wait --for=condition=available deployment --all --timeout=120s -n integration
+
+      - name: Run Integration Tests
+        run: |
+          pip install pytest httpx
+          pytest tests/integration/ -v --timeout=60
+        env:
+          API_BASE_URL: http://$(kubectl get svc api-gateway -n integration -o jsonpath='{.spec.clusterIP}')
+
+      - name: Collect Logs on Failure
+        if: failure()
+        run: kubectl logs -n integration --all-containers=true --prefix=true
+
+      - name: Cleanup k3d
+        if: always()
+        run: k3d cluster delete integration
+
+  # ─────────────────────────────────────────────────────
+  # GITOPS: Update manifests → ArgoCD/Flux deploys
+  # ─────────────────────────────────────────────────────
+  update-gitops:
+    name: Update GitOps Manifests
+    needs: [build-services, integration-tests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout GitOps Repo
+        uses: actions/checkout@v4
+        with:
+          repository: {{ORG}}/{{GITOPS_REPO}}
+          token: ${{ secrets.GITOPS_DEPLOY_TOKEN }}
+          path: gitops
+
+      - name: Update Image Tags (Staging)
+        working-directory: gitops
+        run: |
+          for SERVICE in $(echo '${{ needs.detect-changes.outputs.changed-services }}' | jq -r '.[]'); do
+            cd apps/${SERVICE}/overlays/staging
+            kustomize edit set image ${SERVICE}=${{ env.REGISTRY }}/{{ORG}}/${SERVICE}:${{ github.sha }}
+            cd -
+          done
+
+          git config user.email "ci-bot@example.com"
+          git config user.name "CI Bot"
+          git add .
+          git commit -m "chore(staging): deploy ${{ github.sha }}
+
+Services updated: $(echo '${{ needs.detect-changes.outputs.changed-services }}' | jq -r '.[]' | tr '\n' ', ')
+Triggered by: ${{ github.actor }}
+Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          git push
+
+      # ArgoCD will auto-sync staging — no manual kubectl needed
+
+  # ─────────────────────────────────────────────────────
+  # PRODUCTION deploy (only on release tags)
+  # ─────────────────────────────────────────────────────
+  promote-production:
+    name: Promote to Production
+    needs: [update-gitops]
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: production
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitOps Repo
+        uses: actions/checkout@v4
+        with:
+          repository: {{ORG}}/{{GITOPS_REPO}}
+          token: ${{ secrets.GITOPS_DEPLOY_TOKEN }}
+          path: gitops
+
+      - name: Promote Staging → Production
+        working-directory: gitops
+        run: |
+          for SERVICE in $(echo '${{ needs.detect-changes.outputs.changed-services }}' | jq -r '.[]'); do
+            # Copy staging manifest to production overlay
+            cp apps/${SERVICE}/overlays/staging/kustomization.yaml \
+               apps/${SERVICE}/overlays/production/kustomization.yaml
+          done
+
+          git config user.email "ci-bot@example.com"
+          git config user.name "CI Bot"
+          git add .
+          git commit -m "chore(production): promote ${{ github.ref_name }}
+
+Promoted by: ${{ github.actor }}"
+          git push

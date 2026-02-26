@@ -1,0 +1,294 @@
+---
+# OPA Gatekeeper ConstraintTemplates — Enterprise Policy-as-Code
+# Reference: https://open-policy-agent.github.io/gatekeeper/ | Gatekeeper 3.17+
+# Install: helm install gatekeeper gatekeeper/gatekeeper --namespace gatekeeper-system --create-namespace
+
+# === Template 1: Require Approved Registries ===
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: allowedregistries
+  annotations:
+    description: Only allow images from approved container registries
+spec:
+  crd:
+    spec:
+      names:
+        kind: AllowedRegistries
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            registries:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package allowedregistries
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          not any_prefix_matches(container.image, input.parameters.registries)
+          msg := sprintf("Container '%s' uses image '%s' from an untrusted registry. Allowed registries: %v",
+            [container.name, container.image, input.parameters.registries])
+        }
+
+        input_containers[c] {
+          c := input.review.object.spec.containers[_]
+        }
+        input_containers[c] {
+          c := input.review.object.spec.initContainers[_]
+        }
+        input_containers[c] {
+          c := input.review.object.spec.ephemeralContainers[_]
+        }
+
+        any_prefix_matches(str, prefixes) {
+          prefix := prefixes[_]
+          startswith(str, prefix)
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: AllowedRegistries
+metadata:
+  name: require-approved-registries
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["*"]
+        kinds: ["Pod"]
+    namespaces: ["production", "staging"]
+    excludedNamespaces: ["kube-system", "cert-manager"]
+  parameters:
+    registries:
+      - "ghcr.io/myorg/"
+      - "registry.mycompany.com/"
+      - "gcr.io/distroless/"
+      - "cgr.dev/chainguard/"
+      - "docker.io/library/"     # Official Docker library images only
+
+---
+# === Template 2: No Latest Tag ===
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: bannedimagetags
+spec:
+  crd:
+    spec:
+      names:
+        kind: BannedImageTags
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            tags:
+              type: array
+              items: {type: string}
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package bannedimagetags
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          tag := split(container.image, ":")[1]
+          banned := input.parameters.tags[_]
+          tag == banned
+          msg := sprintf("Container '%s' uses banned image tag '%s'. Pin to a digest (@sha256:...) or specific version.",
+            [container.name, tag])
+        }
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          not contains(container.image, ":")
+          msg := sprintf("Container '%s' has no image tag. Specify version or digest.", [container.name])
+        }
+
+        input_containers[c] {
+          c := input.review.object.spec.containers[_]
+        }
+        input_containers[c] {
+          c := input.review.object.spec.initContainers[_]
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: BannedImageTags
+metadata:
+  name: ban-mutable-image-tags
+spec:
+  enforcementAction: deny
+  match:
+    kinds: [{apiGroups: ["*"], kinds: ["Pod"]}]
+    namespaces: ["production"]
+  parameters:
+    tags: ["latest", "master", "main", "dev", "test", "snapshot", "nightly"]
+
+---
+# === Template 3: Required Labels ===
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: requiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: RequiredLabels
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              items: {type: string}
+            message:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package requiredlabels
+
+        violation[{"msg": msg}] {
+          provided := {label | input.review.object.metadata.labels[label]}
+          required := {label | label := input.parameters.labels[_]}
+          missing := required - provided
+          count(missing) > 0
+          msg := sprintf("%s: Missing required labels: %v. Provided: %v",
+            [input.parameters.message, missing, provided])
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: RequiredLabels
+metadata:
+  name: deployment-required-labels
+spec:
+  enforcementAction: warn    # warn first, promote to deny after adoption
+  match:
+    kinds: [{apiGroups: ["apps"], kinds: ["Deployment", "StatefulSet"]}]
+  parameters:
+    message: "Deployment labeling policy"
+    labels: ["app", "version", "team", "cost-center", "data-classification"]
+
+---
+# === Template 4: No Privileged Containers ===
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: noprivilegedcontainers
+spec:
+  crd:
+    spec:
+      names:
+        kind: NoPrivilegedContainers
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package noprivilegedcontainers
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          container.securityContext.privileged == true
+          msg := sprintf("Container '%s' is privileged. Remove privileged: true.",
+            [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          input.review.object.spec.hostNetwork == true
+          msg := "hostNetwork is not allowed. Use cluster networking."
+        }
+
+        violation[{"msg": msg}] {
+          input.review.object.spec.hostPID == true
+          msg := "hostPID is not allowed."
+        }
+
+        violation[{"msg": msg}] {
+          input.review.object.spec.hostIPC == true
+          msg := "hostIPC is not allowed."
+        }
+
+        input_containers[c] {
+          c := input.review.object.spec.containers[_]
+        }
+        input_containers[c] {
+          c := input.review.object.spec.initContainers[_]
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: NoPrivilegedContainers
+metadata:
+  name: no-privileged-containers
+spec:
+  enforcementAction: deny
+  match:
+    kinds: [{apiGroups: ["*"], kinds: ["Pod"]}]
+    excludedNamespaces: ["kube-system", "falco", "spire"]
+
+---
+# === Template 5: Enforce Namespace Pod Security Level ===
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: podsecuritylevel
+spec:
+  crd:
+    spec:
+      names:
+        kind: PodSecurityLevel
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            level:
+              type: string
+              enum: ["privileged", "baseline", "restricted"]
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package podsecuritylevel
+
+        # Restricted: most secure
+        violation[{"msg": msg}] {
+          input.parameters.level == "restricted"
+          container := input_containers[_]
+          not container.securityContext.runAsNonRoot
+          msg := sprintf("Restricted: Container '%s' must set runAsNonRoot: true", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          input.parameters.level == "restricted"
+          container := input_containers[_]
+          not container.securityContext.readOnlyRootFilesystem
+          msg := sprintf("Restricted: Container '%s' must set readOnlyRootFilesystem: true", [container.name])
+        }
+
+        input_containers[c] {
+          c := input.review.object.spec.containers[_]
+        }
+
+---
+# === Gatekeeper Config: Audit Sync ===
+apiVersion: config.gatekeeper.sh/v1alpha1
+kind: Config
+metadata:
+  name: config
+  namespace: gatekeeper-system
+spec:
+  sync:
+    syncOnly:
+      - group: ""
+        version: "v1"
+        kind: Namespace
+      - group: ""
+        version: "v1"
+        kind: Pod
+      - group: apps
+        version: v1
+        kind: Deployment
+      - group: apps
+        version: v1
+        kind: StatefulSet

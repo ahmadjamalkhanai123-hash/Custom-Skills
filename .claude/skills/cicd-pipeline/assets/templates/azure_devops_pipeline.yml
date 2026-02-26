@@ -1,0 +1,345 @@
+# Azure Pipelines — Tier 3 Production
+# Multi-stage YAML pipeline with Workload Identity Federation (OIDC), container builds,
+# security scanning, and staged deployments.
+# Replace: APP_NAME, REGISTRY_NAME, IMAGE_REPO, AZURE_SUBSCRIPTION, RESOURCE_GROUP,
+#          AKS_CLUSTER_STAGING, AKS_CLUSTER_PROD, SLACK_WEBHOOK_SECRET
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - '**.md'
+      - 'docs/**'
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    exclude:
+      - '**.md'
+
+# ─────────────────────────────────────────────────────────────
+# Variables
+# ─────────────────────────────────────────────────────────────
+variables:
+  APP_NAME: myapp
+  REGISTRY_NAME: myregistry    # Azure Container Registry name (no .azurecr.io)
+  IMAGE_REPO: '$(REGISTRY_NAME).azurecr.io/$(APP_NAME)'
+  IMAGE_TAG: '$(Build.SourceVersion)'
+  IMAGE_FULL: '$(IMAGE_REPO):$(Build.SourceVersion)'
+  COVERAGE_MIN: 80
+  PYTHON_VERSION: '3.12'
+
+  # Service connection names (configured in Azure DevOps → Project Settings)
+  AZURE_SERVICE_CONNECTION: 'azure-oidc-prod'     # Workload Identity Federation
+  ACR_SERVICE_CONNECTION: 'acr-service-connection'
+
+# ─────────────────────────────────────────────────────────────
+# Stages
+# ─────────────────────────────────────────────────────────────
+stages:
+
+  # ───────────────────────────────────
+  # Stage 1: Quality & Security
+  # ───────────────────────────────────
+  - stage: Quality
+    displayName: 'Code Quality & Security'
+    pool:
+      vmImage: 'ubuntu-latest'
+    jobs:
+      - job: Lint
+        displayName: 'Lint & Type Check'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(PYTHON_VERSION)'
+
+          - script: |
+              pip install uv
+              uv sync --frozen
+              uv run ruff check src/ tests/ --output-format=junit > $(Build.ArtifactStagingDirectory)/ruff-report.xml || true
+              uv run ruff format --check src/ tests/
+              uv run mypy src/ --strict --junit-xml=$(Build.ArtifactStagingDirectory)/mypy-report.xml || true
+            displayName: 'Ruff + MyPy'
+
+          - task: PublishTestResults@2
+            displayName: 'Publish Lint Results'
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: '$(Build.ArtifactStagingDirectory)/*.xml'
+            condition: always()
+
+      - job: SecretScan
+        displayName: 'Secret & SAST Scan'
+        steps:
+          - script: |
+              curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.0/gitleaks_8.21.0_linux_x64.tar.gz \
+                | tar xz -C /usr/local/bin/
+              gitleaks detect --source . \
+                --report-format sarif \
+                --report-path $(Build.ArtifactStagingDirectory)/gitleaks.sarif || true
+            displayName: 'Gitleaks Secret Scan'
+
+          - script: |
+              pip install semgrep
+              semgrep scan \
+                --config=p/owasp-top-ten \
+                --config=p/python \
+                --sarif > $(Build.ArtifactStagingDirectory)/semgrep.sarif || true
+            displayName: 'Semgrep SAST'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Security Reports'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'security-reports'
+            condition: always()
+
+  # ───────────────────────────────────
+  # Stage 2: Test
+  # ───────────────────────────────────
+  - stage: Test
+    displayName: 'Tests'
+    dependsOn: Quality
+    pool:
+      vmImage: 'ubuntu-latest'
+    jobs:
+      - job: UnitTests
+        displayName: 'Unit Tests with Coverage'
+        services:
+          postgres:
+            image: postgres:16-alpine
+            env:
+              POSTGRES_DB: testdb
+              POSTGRES_USER: testuser
+              POSTGRES_PASSWORD: testpass
+            ports:
+              - 5432:5432
+          redis:
+            image: redis:7-alpine
+            ports:
+              - 6379:6379
+
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(PYTHON_VERSION)'
+
+          - script: |
+              pip install uv
+              uv sync --frozen
+            displayName: 'Install Dependencies'
+
+          - script: |
+              DATABASE_URL=postgresql://testuser:testpass@localhost:5432/testdb \
+              REDIS_URL=redis://localhost:6379 \
+              uv run pytest tests/unit/ \
+                --cov=src \
+                --cov-report=xml:coverage.xml \
+                --cov-report=html:coverage-html/ \
+                --cov-fail-under=$(COVERAGE_MIN) \
+                --junit-xml=test-results.xml \
+                -v --tb=short
+            displayName: 'Run Unit Tests'
+
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results'
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: 'test-results.xml'
+            condition: always()
+
+          - task: PublishCodeCoverageResults@2
+            displayName: 'Publish Coverage'
+            inputs:
+              summaryFileLocation: 'coverage.xml'
+              pathToSources: 'src'
+            condition: always()
+
+  # ───────────────────────────────────
+  # Stage 3: Build & Push
+  # ───────────────────────────────────
+  - stage: Build
+    displayName: 'Build & Push Image'
+    dependsOn: Test
+    pool:
+      vmImage: 'ubuntu-latest'
+    jobs:
+      - job: BuildPush
+        displayName: 'Docker Build + Push to ACR'
+        steps:
+          # Login to ACR via service connection (Workload Identity Federation)
+          - task: Docker@2
+            displayName: 'Login to ACR'
+            inputs:
+              command: login
+              containerRegistry: '$(ACR_SERVICE_CONNECTION)'
+
+          - task: Docker@2
+            displayName: 'Build Image'
+            inputs:
+              command: buildAndPush
+              repository: '$(APP_NAME)'
+              containerRegistry: '$(ACR_SERVICE_CONNECTION)'
+              tags: |
+                $(Build.SourceVersion)
+                latest
+              arguments: |
+                --build-arg GIT_SHA=$(Build.SourceVersion)
+                --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # Container Security Scan
+          - script: |
+              docker run --rm \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                -v $(Build.ArtifactStagingDirectory):/output \
+                aquasec/trivy:latest image \
+                --format sarif \
+                --output /output/trivy.sarif \
+                --severity HIGH,CRITICAL \
+                --exit-code 1 \
+                $(IMAGE_FULL) || echo "Vulnerabilities found"
+            displayName: 'Trivy Container Scan'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Scan Report'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'container-scan'
+            condition: always()
+
+  # ───────────────────────────────────
+  # Stage 4: Deploy Staging
+  # ───────────────────────────────────
+  - stage: DeployStaging
+    displayName: 'Deploy → Staging'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    pool:
+      vmImage: 'ubuntu-latest'
+    jobs:
+      - deployment: DeployAKS
+        displayName: 'Deploy to AKS Staging'
+        environment: 'staging'   # Links to Azure DevOps Environment (with approvals if needed)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Get AKS credentials via Workload Identity Federation
+                - task: AzureCLI@2
+                  displayName: 'Get AKS Credentials'
+                  inputs:
+                    azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az aks get-credentials \
+                        --resource-group rg-$(APP_NAME)-staging \
+                        --name aks-staging \
+                        --overwrite-existing
+
+                - task: HelmDeploy@0
+                  displayName: 'Helm Deploy Staging'
+                  inputs:
+                    connectionType: None   # Uses kubectl context from above
+                    command: upgrade
+                    chartType: FilePath
+                    chartPath: './helm/$(APP_NAME)'
+                    releaseName: '$(APP_NAME)'
+                    namespace: '$(APP_NAME)-staging'
+                    overrideValues: |
+                      image.repository=$(IMAGE_REPO)
+                      image.tag=$(Build.SourceVersion)
+                      environment=staging
+                    arguments: '--create-namespace --atomic --timeout=5m'
+                    waitForExecution: true
+
+                - script: |
+                    sleep 15
+                    python scripts/smoke_test.py \
+                      --base-url https://$(APP_NAME)-staging.example.com \
+                      --timeout 30
+                  displayName: 'Smoke Test Staging'
+
+  # ───────────────────────────────────
+  # Stage 5: Deploy Production (manual gate)
+  # ───────────────────────────────────
+  - stage: DeployProduction
+    displayName: 'Deploy → Production'
+    dependsOn: DeployStaging
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    pool:
+      vmImage: 'ubuntu-latest'
+    jobs:
+      - deployment: DeployProd
+        displayName: 'Deploy to AKS Production'
+        environment: 'production'   # Azure DevOps Environment with required approvers
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: 'Get AKS Production Credentials'
+                  inputs:
+                    azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az aks get-credentials \
+                        --resource-group rg-$(APP_NAME)-prod \
+                        --name aks-production \
+                        --overwrite-existing
+
+                - task: HelmDeploy@0
+                  displayName: 'Helm Deploy Production'
+                  inputs:
+                    connectionType: None
+                    command: upgrade
+                    chartType: FilePath
+                    chartPath: './helm/$(APP_NAME)'
+                    releaseName: '$(APP_NAME)'
+                    namespace: '$(APP_NAME)'
+                    overrideValues: |
+                      image.repository=$(IMAGE_REPO)
+                      image.tag=$(Build.SourceVersion)
+                      environment=production
+                      replicaCount=3
+                    arguments: '--create-namespace --atomic --timeout=10m'
+                    waitForExecution: true
+
+                - script: |
+                    echo "##vso[build.updatebuildnumber]$(APP_NAME)-$(Build.SourceVersion)"
+                    echo "Production deployment complete: $(IMAGE_FULL)"
+                  displayName: 'Tag Build'
+
+# ─────────────────────────────────────────────────────────────
+# Variable Groups (configure in Azure DevOps Library)
+# ─────────────────────────────────────────────────────────────
+# Create: Project Settings → Pipelines → Library → Variable groups
+#
+# Group: cicd-secrets (linked to Azure Key Vault)
+#   - SLACK_WEBHOOK_URL (secret)
+#   - SONAR_TOKEN (secret)
+#
+# Group: cicd-config
+#   - AZURE_SUBSCRIPTION: <subscription-id>
+#   - RESOURCE_GROUP: rg-myapp
+#
+# ─────────────────────────────────────────────────────────────
+# Workload Identity Federation Setup (Azure CLI)
+# ─────────────────────────────────────────────────────────────
+# az ad app create --display-name "azure-devops-cicd"
+# az ad sp create --id <app-id>
+# az role assignment create \
+#   --assignee <sp-object-id> \
+#   --role "AcrPush" \
+#   --scope /subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.ContainerRegistry/registries/<acr>
+# az role assignment create \
+#   --assignee <sp-object-id> \
+#   --role "Azure Kubernetes Service Cluster User Role" \
+#   --scope /subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.ContainerService/managedClusters/<aks>
+# Then: Add federated credential → Azure DevOps → Service Connection → Workload Identity Federation

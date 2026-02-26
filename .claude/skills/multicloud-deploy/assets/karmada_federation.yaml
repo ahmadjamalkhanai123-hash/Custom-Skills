@@ -1,0 +1,198 @@
+# Karmada Federation — Multi-Cloud Workload Distribution
+# Deploy on management cluster after joining all member clusters
+
+---
+# PropagationPolicy: weighted distribution across all 3 clouds
+apiVersion: policy.karmada.io/v1alpha1
+kind: PropagationPolicy
+metadata:
+  name: microservice-propagation
+  namespace: payments
+  annotations:
+    description: "Distribute payments microservices across AWS, GCP, Azure with failover"
+spec:
+  resourceSelectors:
+    - apiVersion: apps/v1
+      kind: Deployment
+    - apiVersion: v1
+      kind: Service
+    - apiVersion: networking.k8s.io/v1
+      kind: Ingress
+
+  placement:
+    clusterAffinity:
+      clusterNames:
+        - aws-eks
+        - gcp-gke
+        - azure-aks
+
+    replicaScheduling:
+      replicaSchedulingType: Divided
+      replicaDivisionPreference: Weighted
+      weightPreference:
+        staticClusterWeight:
+          - targetCluster:
+              clusterNames: [aws-eks]
+            weight: 5    # 50% — primary cloud
+          - targetCluster:
+              clusterNames: [gcp-gke]
+            weight: 3    # 30%
+          - targetCluster:
+              clusterNames: [azure-aks]
+            weight: 2    # 20%
+
+    # Tolerate cluster failures — failover after 30s
+    clusterTolerations:
+      - key: cluster.karmada.io/not-ready
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30
+      - key: cluster.karmada.io/unreachable
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30
+
+---
+# OverridePolicy: cloud-specific image registry overrides
+apiVersion: policy.karmada.io/v1alpha1
+kind: OverridePolicy
+metadata:
+  name: image-registry-override
+  namespace: payments
+spec:
+  resourceSelectors:
+    - apiVersion: apps/v1
+      kind: Deployment
+  overrideRules:
+    - targetCluster:
+        clusterNames: [aws-eks]
+      overriders:
+        imageOverrider:
+          - component: Registry
+            operator: replace
+            value: "123456789.dkr.ecr.us-east-1.amazonaws.com"
+    - targetCluster:
+        clusterNames: [gcp-gke]
+      overriders:
+        imageOverrider:
+          - component: Registry
+            operator: replace
+            value: "us-central1-docker.pkg.dev/my-project/prod"
+    - targetCluster:
+        clusterNames: [azure-aks]
+      overriders:
+        imageOverrider:
+          - component: Registry
+            operator: replace
+            value: "myprodacr.azurecr.io"
+
+---
+# OverridePolicy: cloud-specific ConfigMap values
+apiVersion: policy.karmada.io/v1alpha1
+kind: OverridePolicy
+metadata:
+  name: cloud-config-override
+  namespace: payments
+spec:
+  resourceSelectors:
+    - apiVersion: v1
+      kind: ConfigMap
+      name: app-config
+  overrideRules:
+    - targetCluster:
+        clusterNames: [aws-eks]
+      overriders:
+        plaintext:
+          - path: "/data/CLOUD_PROVIDER"
+            operator: replace
+            value: "aws"
+          - path: "/data/REGION"
+            operator: replace
+            value: "us-east-1"
+          - path: "/data/STORAGE_BUCKET"
+            operator: replace
+            value: "s3://prod-data-aws"
+    - targetCluster:
+        clusterNames: [gcp-gke]
+      overriders:
+        plaintext:
+          - path: "/data/CLOUD_PROVIDER"
+            operator: replace
+            value: "gcp"
+          - path: "/data/REGION"
+            operator: replace
+            value: "us-central1"
+          - path: "/data/STORAGE_BUCKET"
+            operator: replace
+            value: "gs://prod-data-gcp"
+    - targetCluster:
+        clusterNames: [azure-aks]
+      overriders:
+        plaintext:
+          - path: "/data/CLOUD_PROVIDER"
+            operator: replace
+            value: "azure"
+          - path: "/data/REGION"
+            operator: replace
+            value: "eastus"
+          - path: "/data/STORAGE_BUCKET"
+            operator: replace
+            value: "azblob://prod-data-azure"
+
+---
+# ClusterPropagationPolicy: propagate cluster-scoped resources
+apiVersion: policy.karmada.io/v1alpha1
+kind: ClusterPropagationPolicy
+metadata:
+  name: namespace-propagation
+spec:
+  resourceSelectors:
+    - apiVersion: v1
+      kind: Namespace
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+  placement:
+    clusterAffinity:
+      matchExpressions:
+        - key: environment
+          operator: In
+          values: [production]
+        - key: cloud
+          operator: In
+          values: [aws, gcp, azure]
+
+---
+# Karmada Cluster registration labels (apply after karmadactl join)
+# kubectl label cluster aws-eks cloud=aws region=us-east-1 environment=production tier=primary
+# kubectl label cluster gcp-gke cloud=gcp region=us-central1 environment=production tier=secondary
+# kubectl label cluster azure-aks cloud=azure region=eastus environment=production tier=tertiary
+
+---
+# FederatedHPA: auto-scale across clusters based on aggregate metrics
+apiVersion: autoscaling.karmada.io/v1alpha1
+kind: FederatedHPA
+metadata:
+  name: checkout-api-hpa
+  namespace: payments
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout-api
+  minReplicas: 6    # distributed: 3 AWS + 2 GCP + 1 Azure
+  maxReplicas: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80

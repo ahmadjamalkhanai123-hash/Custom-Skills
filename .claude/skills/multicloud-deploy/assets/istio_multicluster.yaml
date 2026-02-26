@@ -1,0 +1,327 @@
+# Istio Multi-Cluster Federation — Production Template
+# Multi-primary topology: each cluster runs its own istiod
+# East-west gateway bridges cross-cluster communication with mTLS
+
+---
+# ── Step 1: IstioOperator for each cluster ──────────────────────────────────
+# Apply this on AWS EKS (change clusterName + network per cloud)
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: istio-multi-primary
+  namespace: istio-system
+spec:
+  profile: default
+  values:
+    global:
+      meshID: mesh1                   # SAME across all clusters
+      multiCluster:
+        clusterName: aws-eks          # UNIQUE per cluster: aws-eks | gcp-gke | azure-aks
+      network: network-aws            # UNIQUE per cluster: network-aws | network-gcp | network-azure
+
+  components:
+    pilot:
+      k8s:
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2048Mi
+        hpaSpec:
+          minReplicas: 2
+          maxReplicas: 5
+
+  meshConfig:
+    defaultConfig:
+      proxyMetadata:
+        ISTIO_META_DNS_CAPTURE: "true"          # enables DNS proxying for cross-cluster
+        ISTIO_META_DNS_AUTO_ALLOCATE: "true"
+    enablePrometheusMerge: true
+    accessLogFile: /dev/stdout
+    accessLogEncoding: JSON
+    trustDomain: cluster.local
+
+---
+# ── Step 2: East-West Gateway (deploy on each cluster) ──────────────────────
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: istio-eastwestgateway
+  namespace: istio-system
+spec:
+  profile: empty
+  components:
+    ingressGateways:
+      - name: istio-eastwestgateway
+        label:
+          istio: eastwestgateway
+          app: istio-eastwestgateway
+          topology.istio.io/network: network-aws   # change per cluster
+        enabled: true
+        k8s:
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+          hpaSpec:
+            minReplicas: 2
+            maxReplicas: 5
+          serviceAnnotations:
+            # AWS: NLB for low latency
+            service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+            service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+            # GCP: use internal LB annotation instead
+            # cloud.google.com/load-balancer-type: "Internal"
+            # Azure: use internal LB annotation instead
+            # service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+          service:
+            ports:
+              - name: tls
+                port: 15443
+                targetPort: 15443
+              - name: tls-istiod
+                port: 15012
+                targetPort: 15012
+              - name: tls-webhook
+                port: 15017
+                targetPort: 15017
+  values:
+    gateways:
+      istio-ingressgateway:
+        injectionTemplate: gateway
+
+---
+# ── Step 3: Expose services through East-West Gateway ───────────────────────
+# Apply on EACH cluster to expose local services to other clusters
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: cross-network-gateway
+  namespace: istio-system
+spec:
+  selector:
+    istio: eastwestgateway
+  servers:
+    - port:
+        number: 15443
+        name: tls
+        protocol: TLS
+      tls:
+        mode: AUTO_PASSTHROUGH    # pass through to local services via SNI
+      hosts:
+        - "*.local"
+
+---
+# ── Step 4: Strict mTLS (apply cluster-wide) ────────────────────────────────
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system    # applies to ALL namespaces (cluster-wide)
+spec:
+  mtls:
+    mode: STRICT
+
+---
+# ── Step 5: AuthorizationPolicy — default deny, explicit allow ──────────────
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all-default
+  namespace: istio-system    # cluster-wide default
+spec: {}                     # empty spec = deny all
+
+---
+# ── Step 6: Per-service AuthorizationPolicy (example: checkout-api) ─────────
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: checkout-api-allow
+  namespace: payments
+spec:
+  selector:
+    matchLabels:
+      app: checkout-api
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            # Allow from order-service in any cluster (cross-cluster SVID)
+            principals:
+              - "cluster.local/ns/orders/sa/order-processor"
+              - "cluster.local/ns/frontend/sa/web-frontend"
+      to:
+        - operation:
+            methods: ["POST", "GET"]
+            paths: ["/api/v1/*"]
+      when:
+        - key: source.ip
+          notValues: ["0.0.0.0"]   # reject any unidentified source
+
+---
+# ── Step 7: VirtualService with locality-aware routing ──────────────────────
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: checkout-api
+  namespace: payments
+spec:
+  hosts:
+    - checkout-api
+    - checkout-api.payments.svc.cluster.local
+  http:
+    - match:
+        - headers:
+            x-canary: { exact: "true" }
+      route:
+        - destination:
+            host: checkout-api
+            subset: canary
+          weight: 100
+    - route:
+        - destination:
+            host: checkout-api
+            subset: stable
+          weight: 95
+        - destination:
+            host: checkout-api
+            subset: canary
+          weight: 5
+      timeout: 10s
+      retries:
+        attempts: 3
+        perTryTimeout: 3s
+        retryOn: "5xx,reset,connect-failure,retriable-4xx"
+      fault:
+        delay:
+          percentage: { value: 0.1 }
+          fixedDelay: 5s
+
+---
+# ── Step 8: DestinationRule with circuit breaker + locality failover ─────────
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: checkout-api
+  namespace: payments
+spec:
+  host: checkout-api
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 200
+        connectTimeout: 30ms
+      http:
+        h2UpgradePolicy: UPGRADE
+        idleTimeout: 90s
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 10
+
+    outlierDetection:
+      consecutive5xxErrors: 5
+      consecutiveGatewayErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50    # never eject more than 50% of endpoints
+      minHealthPercent: 30
+
+    # Locality-aware load balancing: prefer local cluster, failover to others
+    loadBalancer:
+      localityLbSetting:
+        enabled: true
+        failover:
+          - from: us-east1         # AWS us-east-1 region
+            to: us-central1        # GCP us-central1 (first failover)
+          - from: us-central1
+            to: eastus             # Azure eastus (second failover)
+          - from: eastus
+            to: us-east1           # fallback to AWS if Azure fails too
+
+  subsets:
+    - name: stable
+      labels:
+        version: stable
+    - name: canary
+      labels:
+        version: canary
+
+---
+# ── Step 9: Telemetry — OTel tracing + access logs ──────────────────────────
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: otel-tracing
+  namespace: istio-system
+spec:
+  tracing:
+    - providers:
+        - name: otel-tracing
+      randomSamplingPercentage: 10.0    # 10% in production
+      customTags:
+        cluster_name:
+          environment:
+            name: POD_CLUSTER_NAME
+            defaultValue: unknown
+        cloud_provider:
+          environment:
+            name: CLOUD_PROVIDER
+            defaultValue: unknown
+
+  accessLogging:
+    - providers:
+        - name: envoy
+
+---
+# ── Step 10: OTel Tracing Provider ──────────────────────────────────────────
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: otel-tracing-provider
+  namespace: istio-system
+spec:
+  configPatches:
+    - applyTo: BOOTSTRAP
+      patch:
+        operation: MERGE
+        value:
+          tracing:
+            http:
+              name: envoy.tracers.opentelemetry
+              typedConfig:
+                "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+                grpc_service:
+                  envoy_grpc:
+                    cluster_name: outbound|4317||otel-collector.monitoring.svc.cluster.local
+                  timeout: 0.250s
+                service_name: "istio-proxy"
+
+---
+# ── Setup Commands (run after istioctl install) ──────────────────────────────
+# 1. Share remote secrets between clusters (enables endpoint discovery)
+#
+# From aws-eks, share secret to gcp-gke:
+#   istioctl create-remote-secret \
+#     --context=aws-eks \
+#     --name=aws-eks | kubectl apply --context=gcp-gke -f -
+#
+# From gcp-gke, share secret to aws-eks:
+#   istioctl create-remote-secret \
+#     --context=gcp-gke \
+#     --name=gcp-gke | kubectl apply --context=aws-eks -f -
+#
+# From azure-aks, share to both:
+#   istioctl create-remote-secret \
+#     --context=azure-aks \
+#     --name=azure-aks | kubectl apply --context=aws-eks -f -
+#   istioctl create-remote-secret \
+#     --context=azure-aks \
+#     --name=azure-aks | kubectl apply --context=gcp-gke -f -
+#
+# 2. Verify cross-cluster service discovery:
+#   istioctl proxy-config endpoints \
+#     --context=aws-eks \
+#     deploy/checkout-api.payments | grep gcp-gke
+#
+# 3. Verify mTLS is STRICT:
+#   istioctl authn tls-check \
+#     --context=aws-eks \
+#     checkout-api.payments.svc.cluster.local

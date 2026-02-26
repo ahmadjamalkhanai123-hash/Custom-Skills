@@ -1,0 +1,324 @@
+# GitHub Actions CI/CD Pipeline — Tier 2-3 (Production)
+# Replace: {{APP_NAME}}, {{REGISTRY}}, {{AWS_REGION}}, {{ECR_REPO}}, {{CLUSTER_NAME}}
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy target'
+        type: choice
+        options: [staging, production]
+        default: staging
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: {{APP_NAME}}
+  REGISTRY: {{REGISTRY}}   # e.g., ghcr.io or 123456789.dkr.ecr.us-east-1.amazonaws.com
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write          # OIDC
+  security-events: write   # SARIF upload
+
+jobs:
+  # ─────────────────────────────────────────────────────
+  # STAGE 1: Code Quality (parallel lint + secret scan)
+  # ─────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Dev Dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (Flake8)
+        run: flake8 src/ --max-line-length=120 --statistics
+
+      - name: Type Check (Mypy)
+        run: mypy src/ --strict
+
+      - name: Format Check (Black)
+        run: black --check src/
+
+  secret-scan:
+    name: Secret Detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for TruffleHog
+      - uses: trufflesecurity/trufflehog@v3.63.11
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/owasp-top-ten
+            p/python
+            p/secrets
+          publishToken: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+  # ─────────────────────────────────────────────────────
+  # STAGE 2: Test
+  # ─────────────────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run Tests
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:coverage-html/ \
+            --cov-fail-under=80 \
+            --junitxml=reports/test-results.xml \
+            -v
+        env:
+          DATABASE_URL: postgresql://postgres:testpass@localhost:5432/testdb
+
+      - name: Upload Coverage
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: reports/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────
+  # STAGE 3: Build & Scan
+  # ─────────────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    needs: [lint, secret-scan, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # OIDC login to AWS ECR (no static credentials)
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ECR_ROLE_ARN }}
+          aws-region: {{AWS_REGION}}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/{{ECR_REPO}}
+          tags: |
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=ref,event=branch,prefix=branch-
+
+      - name: Build & Push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+
+  scan-image:
+    name: Container Security Scan
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Trivy Vulnerability Scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/{{ECR_REPO}}@${{ needs.build.outputs.image-digest }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+      - name: Upload SARIF Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  dependency-scan:
+    name: Dependency SCA
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snyk/actions/python@master
+        with:
+          args: --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # ─────────────────────────────────────────────────────
+  # STAGE 4: Deploy Staging (auto on main)
+  # ─────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build, scan-image, dependency-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://staging.{{APP_NAME}}.example.com
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: {{AWS_REGION}}
+
+      - name: Update Kubeconfig
+        run: aws eks update-kubeconfig --name {{CLUSTER_NAME}}-staging --region {{AWS_REGION}}
+
+      - name: Deploy Helm Chart
+        run: |
+          helm upgrade --install ${{ env.APP_NAME }} ./chart \
+            --namespace staging \
+            --create-namespace \
+            --set image.tag=${{ github.sha }} \
+            --set image.digest=${{ needs.build.outputs.image-digest }} \
+            --values chart/values-staging.yaml \
+            --atomic \
+            --timeout 5m \
+            --wait
+
+      - name: Smoke Test
+        run: |
+          sleep 10
+          ./scripts/smoke_test.sh https://staging.${{ env.APP_NAME }}.example.com
+
+  # ─────────────────────────────────────────────────────
+  # STAGE 5: Deploy Production (manual gate on tag)
+  # ─────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    needs: [deploy-staging]
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: production
+      url: https://{{APP_NAME}}.example.com
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: {{AWS_REGION}}
+
+      - name: Update Kubeconfig
+        run: aws eks update-kubeconfig --name {{CLUSTER_NAME}}-production --region {{AWS_REGION}}
+
+      - name: Deploy Helm Chart
+        run: |
+          helm upgrade --install ${{ env.APP_NAME }} ./chart \
+            --namespace production \
+            --set image.tag=${{ github.sha }} \
+            --set image.digest=${{ needs.build.outputs.image-digest }} \
+            --values chart/values-production.yaml \
+            --atomic \
+            --timeout 10m
+
+      - name: Production Smoke Test
+        run: ./scripts/smoke_test.sh https://${{ env.APP_NAME }}.example.com
+
+      - name: Notify Success
+        if: success()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "✅ *${{ env.APP_NAME }}* deployed to production\n• Version: `${{ github.ref_name }}`\n• SHA: `${{ github.sha }}`\n• By: ${{ github.actor }}"
+            }'
+
+      - name: Notify Failure
+        if: failure()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "🚨 *${{ env.APP_NAME }}* production deploy FAILED\n• Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'

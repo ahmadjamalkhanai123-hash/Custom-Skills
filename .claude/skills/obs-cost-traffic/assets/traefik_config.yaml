@@ -1,0 +1,395 @@
+# Traefik v3 — Production Static + Dynamic Configuration
+# Covers: HTTPS, ACME TLS, Prometheus metrics, access logs, rate limiting, mTLS, middlewares
+# Docs: https://doc.traefik.io/traefik/
+
+# =============================================================================
+# STATIC CONFIGURATION (traefik.yaml)
+# Mount as: /etc/traefik/traefik.yaml
+# =============================================================================
+
+# ── Global ────────────────────────────────────────────────────────────────────
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+# ── API & Dashboard ───────────────────────────────────────────────────────────
+api:
+  dashboard: true
+  # IMPORTANT: insecure=true only for local dev. In production, protect via middleware.
+  insecure: false
+
+# ── Entry Points ──────────────────────────────────────────────────────────────
+entryPoints:
+  web:
+    address: ":80"
+    # HTTP → HTTPS redirect (production)
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "example.com"
+            sans:
+              - "*.example.com"
+    http3:
+      advertisedPort: 443
+
+  # Internal metrics endpoint (not exposed externally)
+  metrics-internal:
+    address: ":9100"
+
+  # gRPC / OTLP passthrough
+  grpc:
+    address: ":4317"
+
+# ── TLS / Certificate Resolvers ───────────────────────────────────────────────
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "ops@example.com"
+      storage: "/certs/acme.json"
+      # Choose ONE challenge type:
+      # httpChallenge — simple, needs port 80
+      httpChallenge:
+        entryPoint: web
+      # tlsChallenge: {}  # No ports needed — uncomment if preferred
+      # dnsChallenge:     # For wildcard certs (requires DNS provider plugin)
+      #   provider: cloudflare
+      #   delayBeforeCheck: 0
+
+# ── Providers — where Traefik discovers services ──────────────────────────────
+providers:
+  # Dynamic config from files in /etc/traefik/dynamic/
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+  # Docker provider (auto-discover from labels)
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: traefik-public
+    watch: true
+
+  # Kubernetes CRD (Tier 3+ K8s deployments)
+  # kubernetesIngress:
+  #   allowExternalNameServices: true
+  # kubernetesCRD:
+  #   allowCrossNamespace: true
+
+# ── Observability ─────────────────────────────────────────────────────────────
+metrics:
+  prometheus:
+    entryPoint: metrics-internal
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+    buckets:
+      - 0.005
+      - 0.01
+      - 0.025
+      - 0.05
+      - 0.1
+      - 0.25
+      - 0.5
+      - 1.0
+      - 2.5
+      - 5.0
+      - 10.0
+
+tracing:
+  otlp:
+    grpc:
+      endpoint: "otel-collector:4317"
+      insecure: true
+
+accessLog:
+  format: json
+  filePath: /var/log/traefik/access.log
+  fields:
+    defaultMode: keep
+    names:
+      # Drop noisy fields
+      ClientUsername: drop
+    headers:
+      defaultMode: drop
+      names:
+        # Capture only useful headers
+        X-Request-Id: keep
+        X-Forwarded-For: keep
+        User-Agent: keep
+
+log:
+  level: WARN
+  format: json
+
+# ── Ping (readiness probe) ────────────────────────────────────────────────────
+ping:
+  entryPoint: metrics-internal
+
+# =============================================================================
+# DYNAMIC CONFIGURATION — /etc/traefik/dynamic/middlewares.yaml
+# =============================================================================
+
+# NOTE: Paste into a file named /etc/traefik/dynamic/middlewares.yaml
+# or use Docker labels: traefik.http.middlewares.<name>.ratelimit.average=100
+
+---
+# /etc/traefik/dynamic/middlewares.yaml
+http:
+  middlewares:
+
+    # ── Security Headers ────────────────────────────────────────────────────
+    security-headers:
+      headers:
+        stsSeconds: 63072000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        forceSTSHeader: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        permissionsPolicy: "camera=(), microphone=(), geolocation=()"
+        customResponseHeaders:
+          X-Frame-Options: "SAMEORIGIN"
+          X-Content-Type-Options: "nosniff"
+          X-XSS-Protection: "1; mode=block"
+          Server: ""  # Remove version disclosure
+
+    # ── Rate Limiting ───────────────────────────────────────────────────────
+    rate-limit-api:
+      rateLimit:
+        average: 100       # 100 requests/second average
+        burst: 200         # Allow 200 burst
+        period: 1s
+        sourceCriterion:
+          ipStrategy:
+            depth: 1  # Trust X-Forwarded-For (behind proxy)
+
+    rate-limit-strict:
+      rateLimit:
+        average: 10
+        burst: 20
+        period: 1s
+
+    # ── Request Size Limit ──────────────────────────────────────────────────
+    request-size-limit:
+      buffering:
+        maxRequestBodyBytes: 10485760  # 10MB
+        memRequestBodyBytes: 2097152   # 2MB in memory, rest on disk
+        maxResponseBodyBytes: 104857600  # 100MB
+
+    # ── Circuit Breaker ─────────────────────────────────────────────────────
+    circuit-breaker:
+      circuitBreaker:
+        expression: "NetworkErrorRatio() > 0.30 || ResponseCodeRatio(500, 600, 0, 600) > 0.30 || LatencyAtQuantileMS(50.0) > 2000"
+        checkPeriod: 10s
+        fallbackDuration: 30s
+        recoveryDuration: 60s
+
+    # ── Retry (with backoff) ────────────────────────────────────────────────
+    retry-with-backoff:
+      retry:
+        attempts: 3
+        initialInterval: 100ms
+
+    # ── Compression ─────────────────────────────────────────────────────────
+    compress:
+      compress:
+        excludedContentTypes:
+          - "text/event-stream"  # SSE must not be compressed
+        minResponseBodyBytes: 1024
+
+    # ── Request ID Injection ────────────────────────────────────────────────
+    request-id:
+      plugin:
+        # Requires: --experimental.plugins.requestid.modulename=github.com/tommoulard/requestid
+        requestid:
+          headerName: X-Request-Id
+
+    # ── Basic Auth (protect admin endpoints) ────────────────────────────────
+    admin-auth:
+      basicAuth:
+        usersFile: /etc/traefik/users.htpasswd
+        removeHeader: true  # Don't forward Authorization header upstream
+
+    # ── IP Whitelist (internal services) ────────────────────────────────────
+    internal-only:
+      ipAllowList:
+        sourceRange:
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+          - "192.168.0.0/16"
+
+    # ── CORS (API) ───────────────────────────────────────────────────────────
+    cors-api:
+      headers:
+        accessControlAllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        accessControlAllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Request-Id
+          - X-Trace-Id
+        accessControlAllowOriginList:
+          - "https://app.example.com"
+          - "https://admin.example.com"
+        accessControlMaxAge: 100
+        addVaryHeader: true
+
+    # ── Forwarded Headers Strip (security) ──────────────────────────────────
+    forward-headers:
+      forwardedHeaders:
+        trustedIPs:
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+
+# =============================================================================
+# DYNAMIC CONFIGURATION — /etc/traefik/dynamic/services.yaml
+# =============================================================================
+
+---
+# /etc/traefik/dynamic/services.yaml
+http:
+  routers:
+
+    # ── API Service ──────────────────────────────────────────────────────────
+    api-router:
+      entryPoints:
+        - websecure
+      rule: "Host(`api.example.com`) && PathPrefix(`/v1`)"
+      middlewares:
+        - security-headers
+        - rate-limit-api
+        - compress
+        - circuit-breaker
+      service: api-service
+      tls:
+        certResolver: letsencrypt
+      priority: 10
+
+    # ── Traefik Dashboard (admin, protected) ─────────────────────────────────
+    dashboard-router:
+      entryPoints:
+        - websecure
+      rule: "Host(`traefik.example.com`)"
+      middlewares:
+        - admin-auth
+        - internal-only
+      service: api@internal
+      tls:
+        certResolver: letsencrypt
+
+    # ── AI Agent Endpoint ────────────────────────────────────────────────────
+    agent-router:
+      entryPoints:
+        - websecure
+      rule: "Host(`api.example.com`) && PathPrefix(`/agents`)"
+      middlewares:
+        - security-headers
+        - rate-limit-strict    # Strict rate limit for AI endpoints
+        - request-size-limit
+        - retry-with-backoff
+        - circuit-breaker
+      service: agent-service
+      tls:
+        certResolver: letsencrypt
+      priority: 20  # Higher priority than api-router
+
+    # ── WebSocket / SSE ──────────────────────────────────────────────────────
+    ws-router:
+      entryPoints:
+        - websecure
+      rule: "Host(`api.example.com`) && (PathPrefix(`/ws`) || PathPrefix(`/events`))"
+      middlewares:
+        - security-headers
+      service: ws-service
+      tls:
+        certResolver: letsencrypt
+
+  services:
+
+    api-service:
+      loadBalancer:
+        healthCheck:
+          path: /health
+          interval: 10s
+          timeout: 3s
+          scheme: http
+        passHostHeader: true
+        sticky:
+          cookie:
+            name: lb_sticky
+            secure: true
+            httpOnly: true
+        servers:
+          - url: "http://api-1:8000"
+          - url: "http://api-2:8000"
+          - url: "http://api-3:8000"
+
+    agent-service:
+      loadBalancer:
+        healthCheck:
+          path: /health
+          interval: 30s
+          timeout: 10s
+        passHostHeader: true
+        servers:
+          - url: "http://agent-1:8080"
+          - url: "http://agent-2:8080"
+
+    ws-service:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://ws-server:8765"
+
+# =============================================================================
+# DOCKER LABELS REFERENCE
+# =============================================================================
+# Add to any Docker Compose service to expose via Traefik:
+#
+# labels:
+#   - "traefik.enable=true"
+#   - "traefik.http.routers.myapp.rule=Host(`myapp.example.com`)"
+#   - "traefik.http.routers.myapp.entrypoints=websecure"
+#   - "traefik.http.routers.myapp.tls.certresolver=letsencrypt"
+#   - "traefik.http.routers.myapp.middlewares=security-headers,rate-limit-api"
+#   - "traefik.http.services.myapp.loadbalancer.server.port=8000"
+#   - "traefik.http.services.myapp.loadbalancer.healthcheck.path=/health"
+#   - "traefik.http.services.myapp.loadbalancer.healthcheck.interval=10s"
+
+# =============================================================================
+# KUBERNETES INGRESSROUTE (Tier 3 — CRD)
+# =============================================================================
+# apiVersion: traefik.io/v1alpha1
+# kind: IngressRoute
+# metadata:
+#   name: api-ingress
+#   namespace: default
+# spec:
+#   entryPoints:
+#     - websecure
+#   routes:
+#     - match: Host(`api.example.com`) && PathPrefix(`/v1`)
+#       kind: Rule
+#       middlewares:
+#         - name: security-headers
+#         - name: rate-limit-api
+#       services:
+#         - name: api-service
+#           port: 8000
+#   tls:
+#     certResolver: letsencrypt

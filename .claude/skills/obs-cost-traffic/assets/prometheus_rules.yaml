@@ -1,0 +1,350 @@
+# Prometheus Alerting & Recording Rules
+# Golden Signals + SLO Burn Rate + Kubernetes + Infrastructure
+# Docs: https://prometheus.io/docs/practices/rules/
+
+# =============================================================================
+# RECORDING RULES — pre-compute expensive queries for dashboards
+# =============================================================================
+groups:
+  - name: golden_signals.recording
+    interval: 30s
+    rules:
+      # Request rate per service (5m window)
+      - record: job:http_requests:rate5m
+        expr: |
+          sum(rate(http_requests_total[5m])) by (job, method)
+
+      # Error rate per service (5m window)
+      # Label name: OTel semconv → http_status_code; legacy Prom client → status or code
+      # Adjust the label selector to match your instrumentation library output.
+      - record: job:http_errors:rate5m
+        expr: |
+          sum(rate(http_requests_total{http_status_code=~"5.."}[5m])) by (job, method)
+
+      # Error ratio per service — guard against division-by-zero with bool gate
+      - record: job:http_error_ratio:rate5m
+        expr: |
+          job:http_errors:rate5m
+          / (job:http_requests:rate5m > 0)
+
+      # Latency p50/p95/p99 (5m window) — from histograms
+      - record: job:http_request_duration_p50:rate5m
+        expr: |
+          histogram_quantile(0.50,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (job, le)
+          )
+      - record: job:http_request_duration_p95:rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (job, le)
+          )
+      - record: job:http_request_duration_p99:rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (job, le)
+          )
+
+  # --- SLO Recording Rules (multi-window burn rate) ---
+  - name: slo.availability.recording
+    interval: 30s
+    rules:
+      # NOTE: Adjust the status label to match your instrumentation:
+      #   OTel semconv (opentelemetry-instrumentation-*): http_status_code
+      #   Legacy prometheus_client / direct instrumentation:  status or code
+      #   The expressions below use http_status_code (OTel default).
+
+      # 5-minute availability
+      - record: job:slo_availability:ratio_rate5m
+        labels: {slo: "availability"}
+        expr: |
+          sum(rate(http_requests_total{http_status_code!~"5.."}[5m])) by (job)
+          / sum(rate(http_requests_total[5m])) by (job)
+
+      # 1-hour availability
+      - record: job:slo_availability:ratio_rate1h
+        labels: {slo: "availability"}
+        expr: |
+          sum(rate(http_requests_total{http_status_code!~"5.."}[1h])) by (job)
+          / sum(rate(http_requests_total[1h])) by (job)
+
+      # 6-hour availability
+      - record: job:slo_availability:ratio_rate6h
+        labels: {slo: "availability"}
+        expr: |
+          sum(rate(http_requests_total{http_status_code!~"5.."}[6h])) by (job)
+          / sum(rate(http_requests_total[6h])) by (job)
+
+      # 3-day availability
+      - record: job:slo_availability:ratio_rate3d
+        labels: {slo: "availability"}
+        expr: |
+          sum(rate(http_requests_total{http_status_code!~"5.."}[3d])) by (job)
+          / sum(rate(http_requests_total[3d])) by (job)
+
+      # 30-day availability (current error budget — SLO target = 99.9%)
+      - record: job:slo_availability:ratio_rate30d
+        labels: {slo: "availability"}
+        expr: |
+          sum(rate(http_requests_total{http_status_code!~"5.."}[30d])) by (job)
+          / sum(rate(http_requests_total[30d])) by (job)
+
+      # Error budget remaining (target: 99.9% = 0.999)
+      - record: job:slo_error_budget_remaining:ratio
+        labels: {slo: "availability"}
+        expr: |
+          1 - (1 - job:slo_availability:ratio_rate30d) / (1 - 0.999)
+
+  # --- LLM/AI Agent Recording Rules ---
+  - name: llm.recording
+    interval: 60s
+    rules:
+      # LLM cost rate per agent ($/hr)
+      - record: agent:llm_cost:rate1h
+        expr: |
+          sum(rate(llm_cost_usd_total[1h])) by (agent_name, model) * 3600
+
+      # Token consumption rate
+      - record: agent:llm_tokens:rate5m
+        expr: |
+          sum(rate(llm_tokens_total[5m])) by (agent_name, model, token_type)
+
+# =============================================================================
+# ALERTING RULES
+# =============================================================================
+
+  # --- SLO Burn Rate Alerts ---
+  - name: slo.alerts
+    rules:
+      # CRITICAL: 14.4x burn rate (2% budget consumed in 1h)
+      - alert: SLOBurnRateCritical
+        expr: |
+          (
+            job:slo_availability:ratio_rate1h < (1 - 14.4 * (1 - 0.999))
+            and
+            job:slo_availability:ratio_rate5m < (1 - 14.4 * (1 - 0.999))
+          )
+        for: 2m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "{{ $labels.job }} burning error budget at 14.4x rate"
+          description: |
+            Service {{ $labels.job }} is consuming error budget 14.4x faster than target.
+            At this rate, the 30-day budget will be exhausted in ~2 hours.
+          runbook: "https://wiki.example.com/runbooks/slo-critical"
+
+      # WARNING: 6x burn rate (5% budget consumed in 6h)
+      - alert: SLOBurnRateWarning
+        expr: |
+          (
+            job:slo_availability:ratio_rate6h < (1 - 6 * (1 - 0.999))
+            and
+            job:slo_availability:ratio_rate1h < (1 - 6 * (1 - 0.999))
+          )
+        for: 15m
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "{{ $labels.job }} burning error budget at 6x rate"
+          description: |
+            Service {{ $labels.job }} error budget consumption at 6x target rate.
+            At this rate, 5% of monthly budget consumed in 6 hours.
+
+      # ERROR BUDGET LOW: < 10% remaining
+      - alert: SLOErrorBudgetLow
+        expr: job:slo_error_budget_remaining:ratio < 0.10
+        for: 30m
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "{{ $labels.job }} error budget below 10%"
+          description: |
+            Only {{ $value | humanizePercentage }} error budget remaining for {{ $labels.job }}.
+
+  # --- Golden Signal Alerts ---
+  - name: golden_signals.alerts
+    rules:
+      # High error rate (> 5% for 5m)
+      - alert: HighErrorRate
+        expr: job:http_error_ratio:rate5m > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }} error rate {{ $value | humanizePercentage }}"
+          description: "HTTP error rate exceeding 5% for 5 minutes"
+
+      # Critical error rate (> 20%)
+      - alert: CriticalErrorRate
+        expr: job:http_error_ratio:rate5m > 0.20
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CRITICAL: {{ $labels.job }} error rate {{ $value | humanizePercentage }}"
+
+      # High latency (p99 > 2s for 10m)
+      - alert: HighLatencyP99
+        expr: job:http_request_duration_p99:rate5m > 2.0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }} p99 latency {{ $value | humanizeDuration }}"
+          description: "99th percentile latency exceeding 2 seconds for 10 minutes"
+
+      # Traffic drop (> 50% drop vs 1h ago — possible outage)
+      - alert: TrafficDrop
+        expr: |
+          (
+            sum(rate(http_requests_total[5m])) by (job)
+            / sum(rate(http_requests_total[5m] offset 1h)) by (job)
+          ) < 0.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} traffic dropped by >50%"
+          description: "Current traffic is less than 50% of traffic 1 hour ago"
+
+  # --- Kubernetes Alerts ---
+  - name: kubernetes.alerts
+    rules:
+      - alert: PodCrashLooping
+        expr: |
+          sum(rate(kube_pod_container_status_restarts_total[15m])) by
+            (namespace, pod, container) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} crash looping"
+
+      - alert: PodNotReady
+        expr: |
+          sum by (namespace, pod) (
+            max by (namespace, pod, condition) (
+              kube_pod_status_conditions{condition="Ready",status!="true"}
+            )
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} not ready"
+
+      - alert: DeploymentReplicasMismatch
+        expr: |
+          kube_deployment_spec_replicas != kube_deployment_status_available_replicas
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} replica mismatch"
+
+      - alert: PVCFull
+        expr: |
+          kubelet_volume_stats_available_bytes
+          / kubelet_volume_stats_capacity_bytes * 100 < 10
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is 90%+ full"
+
+      - alert: NodeMemoryPressure
+        expr: |
+          (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 < 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.node }} memory < 10% available"
+
+      - alert: NodeDiskPressure
+        expr: |
+          (
+            node_filesystem_avail_bytes{mountpoint="/"}
+            / node_filesystem_size_bytes{mountpoint="/"} * 100
+          ) < 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} disk < 15% available"
+
+      - alert: NodeCPUSaturation
+        expr: |
+          100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} CPU > 85% for 15m"
+
+  # --- AI Agent Alerts ---
+  - name: ai_agent.alerts
+    rules:
+      - alert: LLMCostSpike
+        expr: |
+          sum(rate(llm_cost_usd_total[10m])) by (agent_name) * 3600 > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Agent {{ $labels.agent_name }} projected LLM cost > $10/hr"
+          description: "Immediate action required to prevent runaway AI costs"
+
+      - alert: LLMHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(llm_request_duration_seconds_bucket[5m])) by (model, le)
+          ) > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM p95 latency > 30s for model {{ $labels.model }}"
+
+      - alert: AgentHighErrorRate
+        expr: |
+          sum(rate(agent_runs_total{status="error"}[5m])) by (agent_name)
+          / sum(rate(agent_runs_total[5m])) by (agent_name) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Agent {{ $labels.agent_name }} error rate > 10%"
+
+      - alert: LLMTokenBudgetExceeded
+        expr: |
+          sum(rate(llm_tokens_total[1h])) by (agent_name) * 3600 > 1000000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent {{ $labels.agent_name }} consuming > 1M tokens/hour"
+
+  # --- OTel Collector Self-Health ---
+  - name: otel_collector.alerts
+    rules:
+      - alert: OTelCollectorDroppedData
+        expr: |
+          sum(rate(otelcol_processor_dropped_spans[5m])) by (processor) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTel Collector processor {{ $labels.processor }} dropping spans"
+
+      - alert: OTelCollectorQueueFull
+        expr: |
+          otelcol_exporter_queue_size / otelcol_exporter_queue_capacity > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTel Collector exporter {{ $labels.exporter }} queue > 80% full"

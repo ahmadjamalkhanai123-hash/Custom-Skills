@@ -1,0 +1,225 @@
+# ArgoCD ApplicationSet — Multi-Cloud GitOps
+# Deploys all microservices to all production clusters automatically
+
+---
+# ApplicationSet: all production clusters, all microservices
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: production-microservices
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+
+  generators:
+    - matrix:
+        generators:
+          # Generator 1: All production clusters
+          - clusters:
+              selector:
+                matchLabels:
+                  environment: production
+          # Generator 2: Services to deploy
+          - list:
+              elements:
+                - service: checkout-api
+                  namespace: payments
+                  replicas: "3"
+                - service: order-service
+                  namespace: orders
+                  replicas: "3"
+                - service: user-service
+                  namespace: users
+                  replicas: "2"
+                - service: inventory-api
+                  namespace: inventory
+                  replicas: "2"
+                - service: notification-service
+                  namespace: notifications
+                  replicas: "1"
+
+  template:
+    metadata:
+      name: "{{.name}}-{{.service}}"
+      annotations:
+        argocd.argoproj.io/sync-wave: "2"
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: production
+
+      source:
+        repoURL: https://github.com/org/platform-gitops
+        targetRevision: main
+        path: "apps/{{.service}}/helm"
+        helm:
+          releaseName: "{{.service}}"
+          valueFiles:
+            - values-production.yaml
+            - "values-{{index .metadata.labels \"cloud\"}}.yaml"
+          parameters:
+            - name: replicaCount
+              value: "{{.replicas}}"
+            - name: global.clusterName
+              value: "{{.name}}"
+            - name: global.cloud
+              value: "{{index .metadata.labels \"cloud\"}}"
+            - name: global.region
+              value: "{{index .metadata.labels \"region\"}}"
+
+      destination:
+        server: "{{.server}}"
+        namespace: "{{.namespace}}"
+
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - ApplyOutOfSyncOnly=true    # only sync what's changed
+          - RespectIgnoreDifferences=true
+        managedNamespaceMetadata:
+          labels:
+            managed-by: argocd
+            environment: production
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 5m
+
+      ignoreDifferences:
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas    # HPA manages replicas
+
+  syncPolicy:
+    applicationsSync: sync     # sync ApplicationSet changes automatically
+    preserveResourcesOnDeletion: false
+
+---
+# ApplicationSet: Infrastructure (Istio, Prometheus, Velero) — Wave 1
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: platform-infrastructure
+  namespace: argocd
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            environment: production
+
+  template:
+    metadata:
+      name: "{{name}}-infra"
+      annotations:
+        argocd.argoproj.io/sync-wave: "1"    # deploy before apps (wave 2)
+    spec:
+      project: platform-infra
+      source:
+        repoURL: https://github.com/org/platform-gitops
+        targetRevision: main
+        path: "infrastructure/{{name}}"
+      destination:
+        server: "{{server}}"
+        namespace: kube-system
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+
+---
+# ArgoCD Project: production workloads
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: production
+  namespace: argocd
+spec:
+  description: Production microservices across all clouds
+
+  sourceRepos:
+    - "https://github.com/org/platform-gitops"
+    - "https://charts.bitnami.com/bitnami"
+    - "https://helm.releases.hashicorp.com"
+
+  destinations:
+    - server: "*"              # all clusters registered in ArgoCD
+      namespace: "payments"
+    - server: "*"
+      namespace: "orders"
+    - server: "*"
+      namespace: "users"
+    - server: "*"
+      namespace: "inventory"
+    - server: "*"
+      namespace: "notifications"
+
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRole
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRoleBinding
+    - group: "networking.istio.io"
+      kind: "*"
+    - group: "security.istio.io"
+      kind: "*"
+
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota    # managed centrally
+    - group: ""
+      kind: LimitRange       # managed centrally
+
+  roles:
+    - name: developer
+      description: Read-only access for developers
+      policies:
+        - "p, proj:production:developer, applications, get, production/*, allow"
+        - "p, proj:production:developer, applications, sync, production/*, allow"
+      groups:
+        - org:developers
+    - name: platform-admin
+      description: Full access for platform team
+      policies:
+        - "p, proj:production:platform-admin, applications, *, production/*, allow"
+      groups:
+        - org:platform-team
+
+---
+# Notification configuration (Slack alerts on sync failure)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd
+data:
+  trigger.on-sync-failed: |
+    - when: app.status.operationState.phase in ['Error', 'Failed']
+      send: [slack-message]
+  trigger.on-sync-succeeded: |
+    - when: app.status.operationState.phase in ['Succeeded']
+      oncePer: app.status.sync.revision
+      send: [slack-message]
+  template.slack-message: |
+    message: |
+      ArgoCD: App *{{.app.metadata.name}}* sync {{.app.status.operationState.phase}}
+      Cluster: {{.app.spec.destination.server}}
+      Revision: {{.app.status.sync.revision}}
+  service.slack: |
+    token: $slack-token
+    username: ArgoCD
+    icon: ":argo:"

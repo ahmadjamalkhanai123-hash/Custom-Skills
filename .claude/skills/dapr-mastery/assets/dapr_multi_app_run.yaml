@@ -1,0 +1,62 @@
+# Dapr Multi-App Run Configuration
+# Usage: dapr run -f dapr.yaml
+# Requires: Dapr CLI v1.10+, Dapr runtime v1.15+
+
+version: 1
+apps:
+  - appID: order-service
+    appDirPath: ./services/order-service
+    appPort: 8001
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+    daprHTTPPort: 3501
+    daprGRPCPort: 50001
+    logLevel: debug
+    resourcesPath: ./components          # Component YAMLs
+    configFilePath: ./config/dapr-config.yaml
+
+  - appID: payment-service
+    appDirPath: ./services/payment-service
+    appPort: 8002
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002"]
+    daprHTTPPort: 3502
+    daprGRPCPort: 50002
+    logLevel: debug
+    resourcesPath: ./components
+
+  - appID: order-actor-service
+    appDirPath: ./services/order-actor-service
+    appPort: 8003
+    command: ["uvicorn", "actor_service:app", "--host", "0.0.0.0", "--port", "8003"]
+    daprHTTPPort: 3503
+    daprGRPCPort: 50003
+    logLevel: debug
+    resourcesPath: ./components
+    configFilePath: ./config/actor-config.yaml  # Actor-specific config
+
+  - appID: workflow-service
+    appDirPath: ./services/workflow-service
+    appPort: 8004
+    command: ["uvicorn", "workflow_saga:app", "--host", "0.0.0.0", "--port", "8004"]
+    daprHTTPPort: 3504
+    daprGRPCPort: 50004
+    logLevel: debug
+    resourcesPath: ./components
+
+  - appID: notification-service
+    appDirPath: ./services/notification-service
+    appPort: 8005
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8005"]
+    daprHTTPPort: 3505
+    daprGRPCPort: 50005
+    logLevel: debug
+    resourcesPath: ./components
+
+---
+# docker-compose.yaml (supporting infrastructure for dev)
+# services:
+#   redis:
+#     image: redis:7-alpine
+#     ports: ["6379:6379"]
+#   zipkin:
+#     image: openzipkin/zipkin:latest
+#     ports: ["9411:9411"]

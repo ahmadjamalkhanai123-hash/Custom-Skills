@@ -1,0 +1,344 @@
+---
+# Kyverno Security Policies — Production Cluster-Wide Enforcement
+# Deploy order: audit first → warn → enforce after validation period
+# Reference: https://kyverno.io/docs/ | Kyverno 1.13+
+
+# === Policy 1: Require Non-Root ===
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-non-root
+  annotations:
+    policies.kyverno.io/title: Require Non-Root Containers
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/minversion: "1.6.0"
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-containers-non-root
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["production", "staging"]
+      validate:
+        message: "Containers must run as non-root. Set securityContext.runAsNonRoot=true and runAsUser >= 1000."
+        pattern:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+            containers:
+              - securityContext:
+                  allowPrivilegeEscalation: false
+
+---
+# === Policy 2: Restrict Privileged ===
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-privileged-containers
+  annotations:
+    policies.kyverno.io/title: Restrict Privileged Containers
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/severity: critical
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-privileged
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kube-system", "falco", "security"]
+              selector:
+                matchLabels:
+                  security-exception: system-component
+      validate:
+        message: "Privileged containers are not permitted. Remove privileged: true."
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.containers[].securityContext[].privileged | contains(@, true) }}"
+                operator: Equals
+                value: true
+
+    - name: no-host-namespaces
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Host namespaces (hostNetwork, hostPID, hostIPC) are not allowed."
+        pattern:
+          spec:
+            =(hostNetwork): "false"
+            =(hostPID): "false"
+            =(hostIPC): "false"
+
+---
+# === Policy 3: Require Resource Limits ===
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-limits
+  annotations:
+    policies.kyverno.io/title: Require Resource Limits
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: validate-limits
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["production", "staging"]
+      validate:
+        message: "CPU and memory limits must be set on all containers."
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.resources.limits.cpu || '' }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.resources.limits.memory || '' }}"
+                    operator: Equals
+                    value: ""
+
+---
+# === Policy 4: Restrict Capabilities ===
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-drop-all-capabilities
+  annotations:
+    policies.kyverno.io/title: Drop All Capabilities
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-drop-all
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["production"]
+      validate:
+        message: "Containers must drop ALL capabilities. Specify capabilities.drop: [ALL]."
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                all:
+                  - key: "ALL"
+                    operator: AnyNotIn
+                    value: "{{ element.securityContext.capabilities.drop || [] }}"
+
+---
+# === Policy 5: Require Read-Only Filesystem ===
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-readonly-rootfs
+  annotations:
+    policies.kyverno.io/title: Read-Only Root Filesystem
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-readonly-rootfs
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["production"]
+      validate:
+        message: "Containers must use readOnlyRootFilesystem: true. Use emptyDir for writable paths."
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.readOnlyRootFilesystem }}"
+                    operator: NotEquals
+                    value: true
+
+---
+# === Policy 6: Disallow Latest Image Tag ===
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  annotations:
+    policies.kyverno.io/title: Disallow Latest Tag
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["production", "staging"]
+      validate:
+        message: "Image tag 'latest' is not allowed. Use a specific version tag or digest."
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: Equals
+                    value: "*:latest"
+                  - key: "{{ contains(element.image, ':') }}"
+                    operator: Equals
+                    value: false
+
+---
+# === Policy 7: Require Unique ServiceAccount ===
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-non-default-serviceaccount
+  annotations:
+    policies.kyverno.io/title: Require Non-Default ServiceAccount
+    policies.kyverno.io/category: Security
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Audit    # Start as audit, promote to Enforce
+  background: true
+  rules:
+    - name: check-serviceaccount
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["production"]
+      validate:
+        message: "Pods in production must use a dedicated ServiceAccount, not 'default'."
+        pattern:
+          spec:
+            serviceAccountName: "?*"    # Any non-empty value
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.serviceAccountName }}"
+                operator: Equals
+                value: "default"
+
+---
+# === Policy 8: Verify Image Signatures (Cosign) ===
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+  annotations:
+    policies.kyverno.io/title: Verify Image Signatures
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: critical
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-cosign-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["production"]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/myorg/*"
+            - "registry.mycompany.com/*"
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    subject: "https://github.com/myorg/*/.github/workflows/*.yaml@refs/heads/main"
+                    issuer: "https://token.actions.githubusercontent.com"
+          mutateDigest: true
+          required: true
+
+---
+# === Policy 9: Generate Default NetworkPolicy ===
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-default-deny-networkpolicy
+  annotations:
+    policies.kyverno.io/title: Default-Deny NetworkPolicy
+    policies.kyverno.io/category: Network Security
+spec:
+  rules:
+    - name: generate-deny-all
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      exclude:
+        any:
+          - resources:
+              names:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                - cert-manager
+                - monitoring
+      generate:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: default-deny-all
+        namespace: "{{request.object.metadata.name}}"
+        synchronize: true
+        data:
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Ingress
+              - Egress
+
+---
+# === Policy 10: Require Seccomp Profile ===
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-seccomp-profile
+  annotations:
+    policies.kyverno.io/title: Require Seccomp Profile
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-seccomp
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["production"]
+      validate:
+        message: "Pods must have a seccomp profile. Set securityContext.seccompProfile.type to RuntimeDefault or Localhost."
+        pattern:
+          spec:
+            securityContext:
+              seccompProfile:
+                type: RuntimeDefault | Localhost

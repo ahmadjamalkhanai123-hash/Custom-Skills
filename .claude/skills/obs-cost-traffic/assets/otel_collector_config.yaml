@@ -1,0 +1,442 @@
+# OpenTelemetry Collector — Production Configuration
+# Covers: OTLP receive → filter/transform → export to metrics/traces/logs backends
+# Supports: Prometheus, Loki, Tempo, Jaeger, CloudWatch, X-Ray, Cloud Trace, Datadog
+# Docs: https://opentelemetry.io/docs/collector/
+
+# =============================================================================
+# RECEIVERS — how telemetry enters the collector
+# =============================================================================
+receivers:
+  # Accept OTel signals via OTLP protocol
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 32
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "http://localhost:*"
+            - "https://*.example.com"
+
+  # Prometheus scraping (pull-based services)
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: "otel-collector"
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["0.0.0.0:8888"]
+        - job_name: "kubernetes-pods"
+          kubernetes_sd_configs:
+            - role: pod
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              action: keep
+              regex: "true"
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+              target_label: __metrics_path__
+              regex: (.+)
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+
+  # Host metrics (CPU, memory, disk, network)
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      disk: {}
+      filesystem: {}
+      network: {}
+      load: {}
+
+  # Docker container metrics
+  docker_stats:
+    endpoint: unix:///var/run/docker.sock
+    collection_interval: 30s
+
+  # Kubernetes cluster metrics
+  k8s_cluster:
+    collection_interval: 30s
+
+  # Filelog receiver (tail log files)
+  filelog:
+    include:
+      - /var/log/apps/**/*.json
+      - /var/log/pods/**/*.log
+    include_file_path: true
+    operators:
+      - type: json_parser
+        timestamp:
+          parse_from: attributes.timestamp
+          layout: "%Y-%m-%dT%H:%M:%S.%fZ"
+      - type: severity_parser
+        parse_from: attributes.level
+      - type: trace_parser
+        trace_id:
+          parse_from: attributes.trace_id
+        span_id:
+          parse_from: attributes.span_id
+
+# =============================================================================
+# PROCESSORS — transform, filter, enrich telemetry
+# =============================================================================
+processors:
+  # Memory protection — drop data before OOM
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 1024
+    spike_limit_mib: 256
+
+  # Batch for efficiency
+  batch:
+    send_batch_size: 1000
+    send_batch_max_size: 2000
+    timeout: 1s
+
+  # Add resource attributes to all telemetry
+  resource:
+    attributes:
+      - action: insert
+        key: deployment.environment
+        from_env: DEPLOYMENT_ENV
+      - action: insert
+        key: cluster.name
+        from_env: CLUSTER_NAME
+      - action: insert
+        key: cloud.provider
+        from_env: CLOUD_PROVIDER
+
+  # Attribute transforms — enrich, redact, filter
+  # Note: The attributes processor sets literal values only.
+  # Use the transform processor (below) for computed/conditional changes.
+  attributes:
+    actions:
+      # Remove PII from spans
+      - key: user.email
+        action: delete
+      - key: user.password
+        action: delete
+      # Delete raw DB statements from attributes (use transform/truncate_all instead)
+      - key: db.statement
+        action: delete
+
+  # Redact sensitive values from logs
+  redaction:
+    allow_all_keys: false
+    allowed_keys:
+      - trace_id
+      - span_id
+      - service.name
+      - level
+      - message
+      - environment
+      - error
+      - timestamp
+      - http.method
+      - http.status_code
+      - http.url
+    blocked_values:
+      - "[0-9]{4}[- ][0-9]{4}[- ][0-9]{4}[- ][0-9]{4}"  # Credit card
+      - "Bearer [A-Za-z0-9\\-._~+/]+"                       # Bearer token
+    summary: debug
+
+  # Filter out noisy spans (health checks, metrics scrapes)
+  filter/spans:
+    spans:
+      exclude:
+        match_type: regexp
+        attributes:
+          - key: http.url
+            value: ".*/health.*|.*/metrics.*|.*/ready.*"
+
+  # Filter low-level log noise
+  filter/logs:
+    logs:
+      exclude:
+        match_type: regexp
+        bodies:
+          - ".*GET /health HTTP.*"
+          - ".*GET /metrics HTTP.*"
+          - ".*GET /ready HTTP.*"
+
+  # Tail-based sampling (keep errors + slow traces + 10% of rest)
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 100000
+    expected_new_traces_per_sec: 1000
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: keep-slow-traces
+        type: latency
+        latency: {threshold_ms: 2000}
+      - name: keep-critical-services
+        type: string_attribute
+        string_attribute:
+          key: service.name
+          values: [payment-service, fraud-detection, auth-service]
+      - name: probabilistic-sample
+        type: probabilistic
+        probabilistic: {sampling_percentage: 10}
+
+  # Span metrics connector (generates metrics from traces)
+  # Placed in connectors section — see below
+
+  # Transform — normalize and clean telemetry using OTTL expressions
+  # Docs: https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/transformprocessor
+  transform:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          # Normalize HTTP URLs — strip query params to reduce cardinality
+          # replace_pattern(path, regex, replacement) is valid OTTL syntax
+          - replace_pattern(attributes["http.url"], "\\?.*", "")
+          # Truncate long DB statements to prevent oversized spans
+          - truncate_all(attributes, 500)
+    metric_statements:
+      - context: datapoint
+        statements:
+          # Drop high-cardinality user/request IDs from metric labels
+          - delete_key(attributes, "user.id")
+          - delete_key(attributes, "request.id")
+          - delete_key(attributes, "session.id")
+
+  # Kubernetes metadata enrichment
+  k8sattributes:
+    passthrough: false
+    auth_type: serviceAccount
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.ip
+      - sources:
+          - from: connection
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.deployment.name
+        - k8s.node.name
+      labels:
+        - tag_name: service
+          key: app.kubernetes.io/name
+          from: pod
+        - tag_name: version
+          key: app.kubernetes.io/version
+          from: pod
+
+# =============================================================================
+# CONNECTORS — receive + export (cross-pipeline bridges)
+# =============================================================================
+connectors:
+  # Generate metrics from trace spans (golden signals from traces)
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+    dimensions:
+      - name: http.method
+      - name: http.status_code
+      - name: service.name
+      - name: deployment.environment
+    exemplars:
+      enabled: true  # Links metrics → trace IDs
+    metrics_flush_interval: 15s
+
+  # Generate service dependency graph metrics
+  servicegraph:
+    metrics_flush_interval: 15s
+    dimensions:
+      - http.method
+    store:
+      ttl: 2s
+      max_items: 1000
+
+# =============================================================================
+# EXPORTERS — where telemetry goes
+# =============================================================================
+exporters:
+  # --- OSS / Self-Hosted ---
+
+  # Prometheus (pull-based metrics)
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    resource_to_telemetry_conversion:
+      enabled: true
+    enable_open_metrics: true
+
+  # Prometheus Remote Write (push to Grafana Cloud, Thanos, Mimir)
+  prometheusremotewrite:
+    endpoint: "https://prometheus-remote-write.grafana.net/api/prom/push"
+    auth:
+      authenticator: basicauth/grafana
+    resource_to_telemetry_conversion:
+      enabled: true
+    tls:
+      insecure: false
+
+  # Tempo (OSS trace storage)
+  otlp/tempo:
+    endpoint: "tempo:4317"
+    tls:
+      insecure: true
+
+  # Loki (OSS log aggregation)
+  loki:
+    endpoint: "http://loki:3100/loki/api/v1/push"
+    labels:
+      resource:
+        service.name: "service_name"
+        deployment.environment: "env"
+        k8s.namespace.name: "namespace"
+    format: logfmt
+
+  # Jaeger (OSS tracing)
+  otlp/jaeger:
+    endpoint: "jaeger:4317"
+    tls:
+      insecure: true
+
+  # OTLP (forward to another collector / Datadog Agent)
+  otlp/downstream:
+    endpoint: "datadog-agent:4317"
+    tls:
+      insecure: true
+
+  # --- AWS Cloud ---
+
+  # AWS X-Ray
+  awsxray:
+    region: "${AWS_REGION}"
+    indexed_attributes:
+      - aws.operation
+      - http.response.status_code
+      - http.url
+      - db.system
+
+  # CloudWatch Metrics (EMF format)
+  awsemf:
+    region: "${AWS_REGION}"
+    log_group_name: "/aws/otel/metrics"
+    log_stream_name: "${CLUSTER_NAME}"
+    resource_to_telemetry_conversion:
+      enabled: true
+    metric_declarations:
+      - dimensions: [[service.name, deployment.environment]]
+        metric_name_selectors:
+          - ".*"
+
+  # CloudWatch Logs
+  awscloudwatchlogs:
+    log_group_name: "/app/${CLUSTER_NAME}"
+    log_stream_name: "otel"
+    region: "${AWS_REGION}"
+
+  # --- GCP Cloud ---
+
+  # Google Cloud Monitoring + Trace + Logging
+  googlecloud:
+    project: "${GCP_PROJECT_ID}"
+    metric:
+      prefix: "custom.googleapis.com/app"
+    log:
+      default_log_name: "opentelemetry.io/collector"
+
+  # --- Azure ---
+
+  # Azure Monitor (Application Insights)
+  azuremonitor:
+    connection_string: "${APPLICATIONINSIGHTS_CONNECTION_STRING}"
+
+  # --- Enterprise ---
+
+  # Datadog
+  datadog:
+    api:
+      key: "${DD_API_KEY}"
+      site: "datadoghq.com"
+    traces:
+      span_name_as_resource_name: true
+    metrics:
+      resource_attributes_as_tags: true
+    logs:
+      enabled: true
+
+  # New Relic
+  otlp/newrelic:
+    endpoint: "otlp.nr-data.net:4317"
+    headers:
+      api-key: "${NEW_RELIC_LICENSE_KEY}"
+
+  # Logging exporter (debug)
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+# =============================================================================
+# EXTENSIONS
+# =============================================================================
+extensions:
+  health_check:
+    endpoint: "0.0.0.0:13133"
+  pprof:
+    endpoint: "0.0.0.0:1777"
+  zpages:
+    endpoint: "0.0.0.0:55679"
+  basicauth/grafana:
+    client_auth:
+      username: "${GRAFANA_CLOUD_USER}"
+      password: "${GRAFANA_CLOUD_API_KEY}"
+
+# =============================================================================
+# SERVICE — wire receivers → processors → exporters into pipelines
+# =============================================================================
+service:
+  extensions: [health_check, pprof, zpages, basicauth/grafana]
+
+  pipelines:
+    # ---- METRICS ----
+    metrics:
+      receivers: [otlp, prometheus, hostmetrics, k8s_cluster]
+      processors: [memory_limiter, resource, k8sattributes, transform, batch]
+      exporters: [prometheus, prometheusremotewrite]
+
+    metrics/spanmetrics:
+      receivers: [spanmetrics, servicegraph]
+      processors: [batch]
+      exporters: [prometheus]
+
+    # ---- TRACES ----
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, k8sattributes, attributes, filter/spans, tail_sampling, batch]
+      exporters: [otlp/tempo, spanmetrics, servicegraph]
+
+    # ---- LOGS ----
+    logs:
+      receivers: [otlp, filelog]
+      processors: [memory_limiter, resource, k8sattributes, redaction, filter/logs, batch]
+      exporters: [loki]
+
+  # Collector self-telemetry
+  telemetry:
+    logs:
+      level: warn
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888

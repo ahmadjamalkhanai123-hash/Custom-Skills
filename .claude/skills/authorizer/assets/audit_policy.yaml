@@ -1,0 +1,220 @@
+# Authorizer Audit Policy — Tiered Rules for Dev → Enterprise
+# CIS K8s Benchmark 1.9 compliant (controls 1.2.13, 1.2.14, 1.2.15)
+# Deploy: /etc/kubernetes/audit-policy.yaml on control plane nodes
+
+---
+# ============================================================
+# TIER 3-5 PRODUCTION AUDIT POLICY
+# Balances completeness with log volume
+# ============================================================
+apiVersion: audit.k8s.io/v1
+kind: Policy
+
+# Never log these noisy, low-value requests
+omitStages:
+  - "RequestReceived"    # RequestResponse already covers completed requests
+
+omitManagedFields: true  # Reduce JSON size significantly
+
+rules:
+  # ── LEVEL 1: Critical — RequestResponse (full request + response body) ──
+
+  # Secrets: full audit (highest risk resource)
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # RBAC modifications: detect privilege escalation
+  - level: RequestResponse
+    resources:
+      - group: "rbac.authorization.k8s.io"
+        resources:
+          - "roles"
+          - "rolebindings"
+          - "clusterroles"
+          - "clusterrolebindings"
+    verbs: ["create", "update", "patch", "delete", "bind", "escalate"]
+
+  # Webhook config changes: policy bypass vector
+  - level: RequestResponse
+    resources:
+      - group: "admissionregistration.k8s.io"
+        resources:
+          - "validatingwebhookconfigurations"
+          - "mutatingwebhookconfigurations"
+    verbs: ["create", "update", "patch", "delete"]
+
+  # Pod exec/attach/portforward: RCE and tunnel vectors
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources:
+          - "pods/exec"
+          - "pods/attach"
+          - "pods/portforward"
+    verbs: ["create"]
+
+  # ServiceAccount token requests
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+
+  # CRD and namespace changes: cluster-wide impact
+  - level: RequestResponse
+    resources:
+      - group: "apiextensions.k8s.io"
+        resources: ["customresourcedefinitions"]
+      - group: ""
+        resources: ["namespaces"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # Node changes: host escape vector
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["nodes"]
+    verbs: ["update", "patch", "delete"]
+
+  # PodSecurityPolicy / PSA changes (legacy)
+  - level: RequestResponse
+    resources:
+      - group: "policy"
+        resources: ["podsecuritypolicies"]
+
+  # ── LEVEL 2: High — Request (request body only, no response) ──
+
+  # ConfigMap changes: may contain sensitive data
+  - level: Request
+    resources:
+      - group: ""
+        resources: ["configmaps"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # PVC/PV changes: data persistence changes
+  - level: Request
+    resources:
+      - group: ""
+        resources: ["persistentvolumeclaims", "persistentvolumes"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # NetworkPolicy changes: network security posture
+  - level: Request
+    resources:
+      - group: "networking.k8s.io"
+        resources: ["networkpolicies"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # Kyverno/OPA policy changes
+  - level: Request
+    resources:
+      - group: "kyverno.io"
+        resources: ["clusterpolicies", "policies"]
+      - group: "constraints.gatekeeper.sh"
+        resources: ["*"]
+      - group: "templates.gatekeeper.sh"
+        resources: ["constrainttemplates"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # cert-manager certificate operations
+  - level: Request
+    resources:
+      - group: "cert-manager.io"
+        resources: ["certificates", "clusterissuers", "issuers"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # ── LEVEL 3: Metadata (no bodies — headers + attributes only) ──
+
+  # Workload CRUD: track deployment activity
+  - level: Metadata
+    resources:
+      - group: "apps"
+        resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+      - group: "batch"
+        resources: ["jobs", "cronjobs"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # ServiceAccount lifecycle
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["serviceaccounts"]
+    verbs: ["create", "update", "delete"]
+
+  # Failed authentication attempts (403/401)
+  - level: Metadata
+    users: ["system:anonymous"]
+
+  # ── LEVEL 4: None — suppress noisy read-only system traffic ──
+
+  # kube-controller-manager, scheduler health checks
+  - level: None
+    users:
+      - "system:kube-controller-manager"
+      - "system:kube-scheduler"
+      - "system:kube-proxy"
+    verbs: ["watch", "list", "get"]
+    resources:
+      - group: ""
+        resources:
+          - "endpoints"
+          - "services"
+          - "pods"
+          - "nodes"
+          - "namespaces"
+
+  # kubelet health probes on own node
+  - level: None
+    userGroups: ["system:nodes"]
+    verbs: ["get"]
+    resources:
+      - group: ""
+        resources: ["nodes/status", "pods/status"]
+
+  # Flux/ArgoCD reconciliation reads (high volume)
+  - level: None
+    users:
+      - "system:serviceaccount:argocd:argocd-application-controller"
+      - "system:serviceaccount:flux-system:helm-controller"
+      - "system:serviceaccount:flux-system:kustomize-controller"
+    verbs: ["get", "list", "watch"]
+
+  # Prometheus scrape requests
+  - level: None
+    users:
+      - "system:serviceaccount:monitoring:prometheus-server"
+    verbs: ["get", "list", "watch"]
+    resources:
+      - group: ""
+        resources: ["pods", "services", "endpoints", "nodes"]
+      - group: "apps"
+        resources: ["replicasets"]
+
+  # Default: log all other requests at Metadata level
+  - level: Metadata
+    omitStages:
+      - "RequestReceived"
+
+---
+# ============================================================
+# MINIMAL AUDIT POLICY — Tier 1-2 (Dev/Staging)
+# Only critical events, lower volume
+# ============================================================
+# apiVersion: audit.k8s.io/v1
+# kind: Policy
+# omitStages:
+#   - "RequestReceived"
+# rules:
+#   - level: RequestResponse
+#     resources:
+#       - group: ""
+#         resources: ["secrets"]
+#       - group: "rbac.authorization.k8s.io"
+#         resources: ["clusterroles","clusterrolebindings"]
+#     verbs: ["create","update","patch","delete"]
+#   - level: Metadata
+#     omitStages:
+#       - "RequestReceived"

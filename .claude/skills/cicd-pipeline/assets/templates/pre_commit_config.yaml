@@ -1,0 +1,142 @@
+# Pre-commit Hooks Configuration — Tier 1 (Developer Local CI)
+# Install: pip install pre-commit && pre-commit install
+# Run all: pre-commit run --all-files
+
+repos:
+  # ─────────────────────────────────────────
+  # Code Quality
+  # ─────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--unsafe]
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: detect-private-key        # Basic private key detection
+
+  # ─────────────────────────────────────────
+  # Secret Detection (critical)
+  # ─────────────────────────────────────────
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.0
+    hooks:
+      - id: gitleaks
+        name: Detect hardcoded secrets (Gitleaks)
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+        name: Detect secrets (detect-secrets)
+        # Initialize baseline: detect-secrets scan > .secrets.baseline
+
+  # ─────────────────────────────────────────
+  # Python
+  # ─────────────────────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix]          # Auto-fix where possible
+        name: Ruff linter
+      - id: ruff-format
+        name: Ruff formatter
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        name: Type check (mypy)
+        additional_dependencies:
+          - types-requests
+          - types-PyYAML
+        args: [--ignore-missing-imports, --strict]
+
+  # ─────────────────────────────────────────
+  # Node.js / JavaScript / TypeScript
+  # ─────────────────────────────────────────
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v9.17.0
+    hooks:
+      - id: eslint
+        files: \.[jt]sx?$
+        types: [file]
+        additional_dependencies:
+          - eslint@9.17.0
+          - '@typescript-eslint/parser'
+          - '@typescript-eslint/eslint-plugin'
+
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        types_or: [javascript, jsx, ts, tsx, json, css, scss, html, markdown, yaml]
+
+  # ─────────────────────────────────────────
+  # Docker / Kubernetes / IaC
+  # ─────────────────────────────────────────
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.13.0-beta
+    hooks:
+      - id: hadolint-docker
+        name: Lint Dockerfiles (hadolint)
+        args:
+          - --ignore=DL3008    # apt-get without version pinning (acceptable)
+          - --ignore=DL3059    # Multiple run commands (acceptable)
+
+  - repo: https://github.com/bridgecrewio/checkov
+    rev: 3.2.336
+    hooks:
+      - id: checkov
+        name: IaC Security Scan (Checkov)
+        args:
+          - --directory=.
+          - --framework=kubernetes,dockerfile,github_actions
+          - --soft-fail-on=MEDIUM   # Don't block on medium
+          - --hard-fail-on=HIGH     # Block on high+
+
+  # ─────────────────────────────────────────
+  # Commit Message
+  # ─────────────────────────────────────────
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v4.1.0
+    hooks:
+      - id: commitizen
+        name: Conventional commits check
+        stages: [commit-msg]
+        # Format: <type>(<scope>): <description>
+        # Types: feat|fix|docs|style|refactor|test|chore|ci|perf
+        # Example: feat(auth): add OAuth2 PKCE flow
+
+  # ─────────────────────────────────────────
+  # Shell Scripts
+  # ─────────────────────────────────────────
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        name: Shell script linting (shellcheck)
+        args: [--severity=warning]
+
+# ─────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────
+default_language_version:
+  python: python3.12
+  node: "20"
+
+default_stages: [pre-commit]   # Run on commit by default
+
+# CI mode: run all hooks (no cache)
+# pre-commit run --all-files --show-diff-on-failure

@@ -1,0 +1,226 @@
+---
+# Falco Custom Rules — Production Security Monitoring
+# Reference: https://falco.org/docs/rules/
+# Deploy: kubectl apply -f falco-custom-rules-configmap.yaml
+# Falco 0.39+
+
+# === Macro Definitions ===
+- macro: container
+  condition: container.id != "host"
+
+- macro: spawned_process
+  condition: evt.type = execve and evt.dir = <
+
+- macro: shell_procs
+  condition: proc.name in (bash, sh, dash, zsh, ksh, tcsh, csh, ash, fish)
+
+- macro: outbound
+  condition: >
+    evt.type in (sendto, sendmsg)
+    and evt.dir = <
+    and fd.typechar = 4
+    and fd.connected = true
+
+- list: known_k8s_sa_readers
+  items: [vault-agent, kubectl, kubelet]
+
+- list: known_privileged_images
+  items:
+    - docker.io/calico/node
+    - docker.io/falcosecurity/falco
+    - quay.io/cilium/cilium
+
+- list: trusted_cidr_ranges
+  items: []   # Fill with your internal CIDRs
+
+---
+# === Critical: Container Escape ===
+- rule: Container Escape via Mount Syscall
+  desc: A process in a container attempted to use mount, which may indicate container escape
+  condition: >
+    spawned_process and container
+    and proc.name in (mount, umount, unshare)
+    and not proc.pname in (runc, containerd, dockerd, crio)
+    and not proc.cmdline contains "tmpfs"
+  output: >
+    CRITICAL: Container escape via mount (user=%user.name uid=%user.uid
+     cmd=%proc.cmdline pid=%proc.pid ppid=%proc.ppid container=%container.name
+     image=%container.image.repository:%container.image.tag pod=%k8s.pod.name
+     ns=%k8s.ns.name)
+  priority: CRITICAL
+  tags: [container, escape, host_compromise, MITRE_T1611, cis]
+
+- rule: Privileged Container Started
+  desc: A privileged container was started, giving it full access to the host
+  condition: >
+    container_started
+    and container.privileged = true
+    and not container.image.repository in (known_privileged_images)
+  output: >
+    CRITICAL: Privileged container started (image=%container.image.repository:%container.image.tag
+     container=%container.name pod=%k8s.pod.name ns=%k8s.ns.name)
+  priority: CRITICAL
+  tags: [container, privilege, cis, MITRE_T1611]
+
+- rule: nsenter Process in Container
+  desc: nsenter used to escape container namespaces
+  condition: >
+    spawned_process and container
+    and proc.name = nsenter
+  output: >
+    CRITICAL: nsenter execution in container (user=%user.name
+     cmd=%proc.cmdline container=%container.name image=%container.image.repository)
+  priority: CRITICAL
+  tags: [container, escape, MITRE_T1611]
+
+---
+# === High: Privilege Escalation ===
+- rule: Sudo or Setuid Binary Execution in Container
+  desc: Execution of privilege escalation binaries in a container
+  condition: >
+    spawned_process and container
+    and proc.name in (sudo, su, pkexec, doas)
+  output: >
+    WARNING: Privilege escalation attempt (user=%user.name cmd=%proc.cmdline
+     container=%container.name image=%container.image.repository pod=%k8s.pod.name)
+  priority: WARNING
+  tags: [privilege_escalation, MITRE_T1548]
+
+- rule: Shell Spawned Inside Container
+  desc: An interactive shell was spawned in a running container (possible intrusion)
+  condition: >
+    spawned_process and container
+    and shell_procs
+    and proc.pname in (exe, runc, kubectl, docker, containerd)
+  output: >
+    WARNING: Interactive shell spawned in container (user=%user.name shell=%proc.name
+     parent=%proc.pname cmd=%proc.cmdline container=%container.name
+     image=%container.image.repository pod=%k8s.pod.name ns=%k8s.ns.name)
+  priority: WARNING
+  tags: [shell, intrusion, MITRE_T1059]
+
+---
+# === High: Sensitive File Access ===
+- rule: Read Sensitive Files in Container
+  desc: Sensitive files accessed in a container (credential theft risk)
+  condition: >
+    open_read and container
+    and (fd.name startswith /etc/shadow
+         or fd.name startswith /etc/sudoers
+         or fd.name = /etc/passwd
+         or fd.name startswith /root/.ssh
+         or fd.name startswith /proc/1/environ
+         or fd.name = /proc/keys
+         or fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount)
+    and not proc.name in (known_k8s_sa_readers)
+  output: >
+    HIGH: Sensitive file read in container (user=%user.name file=%fd.name
+     proc=%proc.name container=%container.name image=%container.image.repository)
+  priority: WARNING
+  tags: [filesystem, credential_access, MITRE_T1552]
+
+- rule: Write Binary Dir in Container
+  desc: A file was written to a binary directory (malware persistence)
+  condition: >
+    open_write and container
+    and fd.directory in (/bin, /sbin, /usr/bin, /usr/sbin, /usr/local/bin)
+  output: >
+    HIGH: Write to binary directory in container (user=%user.name
+     file=%fd.name proc=%proc.name container=%container.name image=%container.image.repository)
+  priority: WARNING
+  tags: [filesystem, persistence, MITRE_T1574]
+
+---
+# === High: Network Anomalies ===
+- rule: Unexpected Network Connection from Container
+  desc: Container made a network connection to an unexpected destination
+  condition: >
+    outbound and container
+    and not fd.sip in (trusted_cidr_ranges)
+    and not (fd.port in (53, 80, 443, 8080, 8443, 5432, 6379, 9090, 9091, 2801))
+    and not container.image.repository in (known_privileged_images)
+  output: >
+    WARNING: Unexpected outbound connection (container=%container.name
+     image=%container.image.repository destination=%fd.rip:%fd.rport
+     proc=%proc.name pod=%k8s.pod.name ns=%k8s.ns.name)
+  priority: WARNING
+  tags: [network, anomaly, MITRE_T1071]
+
+- rule: Port Scanning from Container
+  desc: Container attempting to scan ports (lateral movement)
+  condition: >
+    outbound and container
+    and fd.typechar = 4
+    and evt.count > 100
+    and fd.sport > 1024
+  output: >
+    HIGH: Potential port scan from container (container=%container.name
+     image=%container.image.repository src=%fd.lip dst=%fd.rip)
+  priority: WARNING
+  tags: [network, lateral_movement, MITRE_T1046]
+
+---
+# === Critical: Cryptocurrency Mining ===
+- rule: Crypto Mining Process Detected
+  desc: Known cryptocurrency mining process detected
+  condition: >
+    spawned_process
+    and (proc.name in (xmrig, minerd, cpuminer, ethminer, claymore, nbminer, gminer, t-rex, teamredminer, phoenixminer)
+         or proc.cmdline contains "stratum+tcp://"
+         or proc.cmdline contains "stratum+ssl://"
+         or proc.cmdline contains "--donate-level"
+         or proc.cmdline contains "mining.pool"
+         or proc.cmdline contains "xmrpool")
+  output: >
+    CRITICAL: Cryptocurrency mining detected (proc=%proc.name cmd=%proc.cmdline
+     user=%user.name container=%container.name image=%container.image.repository)
+  priority: CRITICAL
+  tags: [crypto_mining, resource_hijacking, MITRE_T1496]
+
+---
+# === High: Kubernetes-Specific ===
+- rule: K8s ServiceAccount Token Access
+  desc: ServiceAccount token accessed (lateral movement potential)
+  condition: >
+    open_read and container
+    and fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount/token
+    and not proc.name in (known_k8s_sa_readers)
+  output: >
+    HIGH: K8s SA token accessed (proc=%proc.name user=%user.name
+     container=%container.name image=%container.image.repository)
+  priority: WARNING
+  tags: [k8s, lateral_movement, MITRE_T1552]
+
+- rule: K8s Audit Log Cleared
+  desc: Kubernetes audit log file was deleted or cleared
+  condition: >
+    (fd.name contains "audit.log" or fd.name contains "kube-audit")
+    and (evt.type in (unlink, unlinkat, truncate, ftruncate))
+    and not proc.name in (logrotate, truncate)
+  output: >
+    CRITICAL: Kubernetes audit log cleared (file=%fd.name proc=%proc.name user=%user.name)
+  priority: CRITICAL
+  tags: [k8s, defense_evasion, MITRE_T1562]
+
+---
+# === Falco DaemonSet Kubernetes Deployment ===
+# Deploy via Helm: see references/runtime-security.md
+# Custom rules ConfigMap:
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-custom-rules
+  namespace: falco
+  labels:
+    app: falco
+data:
+  custom-rules.yaml: |
+    # Include all rules above in this key
+    # Then reference in Helm values:
+    # falco:
+    #   rules_files:
+    #     - /etc/falco/falco_rules.yaml
+    #     - /etc/falco/falco_rules.local.yaml
+    #     - /etc/falco/k8s_audit_rules.yaml
+    #     - /etc/falco/rules.d

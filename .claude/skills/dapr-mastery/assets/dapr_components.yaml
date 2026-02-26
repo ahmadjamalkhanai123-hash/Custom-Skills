@@ -1,0 +1,335 @@
+# Dapr Component Templates — Copy and customize per environment
+# All secrets via secretKeyRef (NEVER plaintext in production)
+
+---
+# ── State Store: Redis (Dev/Staging) ──────────────────────────────────────────
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: statestore
+  namespace: production
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      secretKeyRef: { name: redis-secret, key: host }
+    - name: redisPassword
+      secretKeyRef: { name: redis-secret, key: password }
+    - name: enableTLS
+      value: "true"
+    - name: failover
+      value: "true"
+    - name: sentinelMasterName
+      value: "mymaster"
+    - name: ttlInSeconds
+      value: "86400"       # 24h default TTL
+    - name: maxRetries
+      value: "3"
+    - name: maxRetryBackoff
+      value: "2000000000"  # 2s in nanoseconds
+scopes:
+  - order-service
+  - payment-service
+  - order-actor-service
+
+---
+# ── State Store: PostgreSQL (Production) ──────────────────────────────────────
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: statestore-pg
+  namespace: production
+spec:
+  type: state.postgresql/v2
+  version: v1
+  metadata:
+    - name: connectionString
+      secretKeyRef: { name: pg-secret, key: connectionString }
+    - name: schema
+      value: "dapr_state"
+    - name: tablePrefix
+      value: "app_"
+    - name: cleanupIntervalInSeconds
+      value: "300"
+    - name: maxConns
+      value: "20"
+    - name: connMaxIdleTime
+      value: "15m"
+scopes:
+  - order-service
+  - workflow-service
+
+---
+# ── Pub/Sub: Kafka (Production) ───────────────────────────────────────────────
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: kafka-pubsub
+  namespace: production
+spec:
+  type: pubsub.kafka
+  version: v1
+  metadata:
+    - name: brokers
+      secretKeyRef: { name: kafka-secret, key: brokers }
+    - name: consumerGroup
+      value: "dapr-production-group"
+    - name: authType
+      value: "certificate"
+    - name: caCert
+      secretKeyRef: { name: kafka-secret, key: caCert }
+    - name: clientCert
+      secretKeyRef: { name: kafka-secret, key: cert }
+    - name: clientKey
+      secretKeyRef: { name: kafka-secret, key: key }
+    - name: initialOffset
+      value: "newest"
+    - name: maxMessageBytes
+      value: "1048576"   # 1MB
+    - name: oidcTokenEndpoint
+      value: ""          # If using OIDC auth
+scopes:
+  - order-service
+  - payment-service
+  - notification-service
+
+---
+# ── Pub/Sub: Azure Service Bus (Enterprise) ────────────────────────────────────
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: servicebus-pubsub
+  namespace: production
+spec:
+  type: pubsub.azure.servicebus.topics
+  version: v1
+  metadata:
+    - name: namespaceName
+      value: "mycompany-prod.servicebus.windows.net"
+    - name: azureClientId
+      value: "managed-identity-client-id"   # Use Managed Identity on AKS
+    - name: maxDeliveryCount
+      value: "10"
+    - name: lockDurationInSec
+      value: "60"
+    - name: defaultMessageTimeToLiveInSec
+      value: "604800"    # 7 days
+    - name: autoDeleteOnIdleInSec
+      value: "-1"        # Never auto-delete
+    - name: maxConcurrentHandlers
+      value: "8"
+    - name: prefetchCount
+      value: "32"
+
+---
+# ── Secret Store: Kubernetes (Default) ────────────────────────────────────────
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: kubernetes-secrets
+  namespace: production
+spec:
+  type: secretstores.kubernetes
+  version: v1
+# No additional metadata needed — uses service account
+
+---
+# ── Secret Store: HashiCorp Vault (Enterprise) ────────────────────────────────
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: vault-store
+  namespace: production
+spec:
+  type: secretstores.hashicorp.vault
+  version: v1
+  metadata:
+    - name: vaultAddr
+      value: "https://vault.internal.company.com:8200"
+    - name: vaultTokenMountPath
+      value: "/var/run/secrets/vault/token"
+    - name: enginePath
+      value: "secret"
+    - name: vaultKVVersion
+      value: "v2"
+    - name: tlsCACert
+      secretKeyRef: { name: vault-tls, key: ca.crt }
+    - name: namespace
+      value: "production"
+
+---
+# ── Subscription: Orders Topic ─────────────────────────────────────────────────
+apiVersion: dapr.io/v1alpha1
+kind: Subscription
+metadata:
+  name: orders-subscription
+  namespace: production
+spec:
+  pubsubname: kafka-pubsub
+  topic: orders.created
+  routes:
+    rules:
+      - match: event.type == "order.priority"
+        path: /orders/priority
+      - match: event.type == "order.standard"
+        path: /orders/standard
+    default: /orders/handler
+  deadLetterTopic: orders.dlq
+  bulkSubscribe:
+    enabled: true
+    maxMessagesCount: 100
+    maxAwaitDurationMs: 2000
+scopes:
+  - payment-service
+  - order-processor
+
+---
+# ── Dapr Configuration: Production ────────────────────────────────────────────
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: production-config
+  namespace: production
+spec:
+  tracing:
+    samplingRate: "0.01"      # 1% sampling in production
+    otel:
+      endpointAddress: "otel-collector.observability:4317"
+      isSecure: false
+      protocol: grpc
+  metric:
+    enabled: true
+    rules:
+      - labels:
+          - name: app_id
+  accessControl:
+    defaultAction: deny
+    trustDomain: "cluster.local"
+    policies:
+      - appId: order-service
+        defaultAction: allow
+        namespace: production
+        operations:
+          - name: /orders/**
+            httpVerb: [GET, POST, PUT]
+            action: allow
+      - appId: api-gateway
+        defaultAction: allow
+        namespace: production
+  features:
+    - name: SchedulerReminders
+      enabled: true            # v1.15+: use Scheduler service for reminders
+
+---
+# ── Dapr Configuration: Actor Services ────────────────────────────────────────
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: actor-config
+  namespace: production
+spec:
+  tracing:
+    samplingRate: "0.01"
+    otel:
+      endpointAddress: "otel-collector.observability:4317"
+      isSecure: false
+      protocol: grpc
+  entities:
+    - OrderActor
+    - PaymentActor
+    - InventoryActor
+  actorIdleTimeout: 1h
+  actorScanInterval: 30s
+  drainOngoingCallTimeout: 60s
+  drainRebalancedActors: true
+  reentrancy:
+    enabled: true
+    maxStackDepth: 32
+  remindersStoragePartitions: 7
+  features:
+    - name: SchedulerReminders
+      enabled: true
+
+---
+# ── Resiliency Policy: Production ─────────────────────────────────────────────
+apiVersion: dapr.io/v1alpha1
+kind: Resiliency
+metadata:
+  name: production-resiliency
+  namespace: production
+spec:
+  policies:
+    retries:
+      exponential-retry:
+        policy: exponential
+        initialInterval: 500ms
+        randomizationFactor: 0.5
+        multiplier: 1.5
+        maxInterval: 30s
+        maxRetries: 3
+      critical-retry:
+        policy: exponential
+        initialInterval: 200ms
+        randomizationFactor: 0.3
+        multiplier: 2.0
+        maxInterval: 60s
+        maxRetries: 7
+      no-retry:
+        policy: constant
+        maxRetries: 0
+
+    timeouts:
+      fast-ops: { duration: 3s }
+      standard-ops: { duration: 10s }
+      payment-ops: { duration: 30s }
+      batch-ops: { duration: 5m }
+
+    circuitBreakers:
+      standard-cb:
+        maxRequests: 1
+        interval: 10s
+        timeout: 60s
+        trip: consecutiveFailures > 5
+      aggressive-cb:
+        maxRequests: 1
+        interval: 5s
+        timeout: 30s
+        trip: consecutiveFailures > 3
+
+  targets:
+    apps:
+      payment-service:
+        timeout: payment-ops
+        retry: critical-retry
+        circuitBreaker: aggressive-cb
+      order-service:
+        timeout: standard-ops
+        retry: exponential-retry
+        circuitBreaker: standard-cb
+      notification-service:
+        timeout: fast-ops
+        retry: no-retry
+
+    components:
+      statestore:
+        outbound:
+          timeout: standard-ops
+          retry: exponential-retry
+          circuitBreaker: standard-cb
+      kafka-pubsub:
+        outbound:
+          timeout: standard-ops
+          retry: exponential-retry
+          circuitBreaker: standard-cb
+        inbound:
+          timeout: standard-ops
+          retry: exponential-retry
+
+    actors:
+      OrderActor:
+        timeout: standard-ops
+        retry: exponential-retry
+        circuitBreaker: standard-cb
+        circuitBreakerScope: id
+        circuitBreakerCacheSize: 5000

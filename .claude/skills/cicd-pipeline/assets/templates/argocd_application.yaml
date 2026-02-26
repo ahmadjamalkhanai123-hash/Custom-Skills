@@ -1,0 +1,283 @@
+# ArgoCD Application — Production GitOps
+# Replace: {{APP_NAME}}, {{GITOPS_REPO_URL}}, {{TARGET_NAMESPACE}}, {{ARGOCD_PROJECT}}
+
+---
+# Application for Staging
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{APP_NAME}}-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: {{APP_NAME}}
+    environment: staging
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io  # Enable cascade deletion
+  annotations:
+    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: deployments
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: alerts
+spec:
+  project: {{ARGOCD_PROJECT}}
+
+  source:
+    repoURL: {{GITOPS_REPO_URL}}
+    targetRevision: main
+    path: apps/{{APP_NAME}}/overlays/staging
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{TARGET_NAMESPACE}}-staging
+
+  syncPolicy:
+    automated:
+      prune: true           # Remove resources deleted from Git
+      selfHeal: true        # Fix manual changes (drift correction)
+      allowEmpty: false     # Never allow empty app (safety net)
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - RespectIgnoreDifferences=true
+      - ApplyOutOfSyncOnly=true  # Only sync changed resources
+    managedNamespaceMetadata:
+      labels:
+        environment: staging
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas  # HPA manages replica count
+    - group: ""
+      kind: Secret
+      jsonPointers:
+        - /data  # External secrets operator manages secret data
+
+---
+# Application for Production
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{APP_NAME}}-production
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: {{APP_NAME}}
+    environment: production
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  annotations:
+    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: deployments
+    notifications.argoproj.io/subscribe.on-sync-failed.pagerduty: production-alerts
+    notifications.argoproj.io/subscribe.on-health-degraded.pagerduty: production-alerts
+spec:
+  project: {{ARGOCD_PROJECT}}
+
+  source:
+    repoURL: {{GITOPS_REPO_URL}}
+    targetRevision: main
+    path: apps/{{APP_NAME}}/overlays/production
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{TARGET_NAMESPACE}}
+
+  syncPolicy:
+    # Production: NO auto-sync — require manual approval
+    # automated: (intentionally omitted)
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - RespectIgnoreDifferences=true
+    managedNamespaceMetadata:
+      labels:
+        environment: production
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m
+
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+
+---
+# ArgoCD AppProject — RBAC and Source Control
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: {{ARGOCD_PROJECT}}
+  namespace: argocd
+spec:
+  description: "{{APP_NAME}} project — manages staging and production deployments"
+
+  # Only allow deployments from this repo
+  sourceRepos:
+    - {{GITOPS_REPO_URL}}
+
+  # Only allow deployments to specific clusters/namespaces
+  destinations:
+    - namespace: {{TARGET_NAMESPACE}}-staging
+      server: https://kubernetes.default.svc
+    - namespace: {{TARGET_NAMESPACE}}
+      server: https://kubernetes.default.svc
+
+  # Restrict allowed K8s resource kinds
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+    - group: apps
+      kind: ReplicaSet
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+    - group: argoproj.io
+      kind: Rollout  # Argo Rollouts
+
+  # RBAC roles within project
+  roles:
+    - name: developer
+      description: Read-only access to staging
+      policies:
+        - p, proj:{{ARGOCD_PROJECT}}:developer, applications, get, {{ARGOCD_PROJECT}}/*, allow
+        - p, proj:{{ARGOCD_PROJECT}}:developer, applications, sync, {{ARGOCD_PROJECT}}/*-staging, allow
+      groups:
+        - dev-team
+
+    - name: deployer
+      description: Full access including production sync
+      policies:
+        - p, proj:{{ARGOCD_PROJECT}}:deployer, applications, *, {{ARGOCD_PROJECT}}/*, allow
+      groups:
+        - platform-team
+        - devops-team
+
+---
+# Argo Rollouts — Canary Deployment (optional)
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{APP_NAME}}
+  namespace: {{TARGET_NAMESPACE}}
+spec:
+  replicas: 5
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: {{APP_NAME}}
+  template:
+    metadata:
+      labels:
+        app: {{APP_NAME}}
+    spec:
+      containers:
+        - name: {{APP_NAME}}
+          image: PLACEHOLDER  # Updated by CI/Flux/ArgoCD Image Updater
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+  strategy:
+    canary:
+      canaryService: {{APP_NAME}}-canary
+      stableService: {{APP_NAME}}-stable
+      trafficRouting:
+        nginx:
+          stableIngress: {{APP_NAME}}-stable
+      steps:
+        - setWeight: 10
+        - pause: {duration: 5m}
+        - analysis:
+            templates:
+              - templateName: success-rate
+            args:
+              - name: service-name
+                value: {{APP_NAME}}-canary
+        - setWeight: 30
+        - pause: {duration: 10m}
+        - analysis:
+            templates:
+              - templateName: success-rate
+              - templateName: latency-p95
+        - setWeight: 100
+      antiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution: {}
+
+---
+# AnalysisTemplate — Prometheus metrics gate
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: {{TARGET_NAMESPACE}}
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: success-rate
+      interval: 2m
+      successCondition: result[0] >= 0.95
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            sum(rate(http_requests_total{service="{{`{{args.service-name}}`}}",status=~"2.."}[5m]))
+            /
+            sum(rate(http_requests_total{service="{{`{{args.service-name}}`}}"}[5m]))
+
+---
+# ArgoCD Image Updater — auto-update image tags
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-image-updater-config
+  namespace: argocd
+data:
+  applications.yaml: |
+    applications:
+      - name: {{APP_NAME}}-staging
+        namespace: argocd
+        image_list:
+          - alias: {{APP_NAME}}
+            image: REGISTRY/{{APP_NAME}}
+            update-strategy: semver
+            allow-tags: regexp:^v[0-9]+\.[0-9]+\.[0-9]+
+        write-back-method: git
+        git:
+          repo: {{GITOPS_REPO_URL}}
+          branch: main

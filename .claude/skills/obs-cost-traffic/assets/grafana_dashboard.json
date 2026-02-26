@@ -1,0 +1,647 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    },
+    {
+      "name": "DS_LOKI",
+      "label": "Loki",
+      "description": "Loki datasource",
+      "type": "datasource",
+      "pluginId": "loki",
+      "pluginName": "Loki"
+    },
+    {
+      "name": "DS_TEMPO",
+      "label": "Tempo",
+      "description": "Tempo datasource",
+      "type": "datasource",
+      "pluginId": "tempo",
+      "pluginName": "Tempo"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "11.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "datasource", "id": "loki", "name": "Loki", "version": "1.0.0" },
+    { "type": "datasource", "id": "tempo", "name": "Tempo", "version": "1.0.0" }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "enable": true,
+        "expr": "changes(kube_deployment_status_replicas_updated{namespace=~\"$namespace\"}[2m]) > 0",
+        "hide": false,
+        "iconColor": "green",
+        "name": "Deployments",
+        "step": "60s",
+        "titleFormat": "Deploy: {{deployment}}"
+      }
+    ]
+  },
+  "description": "Golden Signals, SLO Error Budget, AI/LLM Costs, and Kubernetes Health — obs-cost-traffic skill",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "🔴 Golden Signals",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Request rate per service (rpm)",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "reqps"
+        }
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 1 },
+      "id": 1,
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(http_requests_total{job=~\"$job\"}[5m])) by (job)",
+          "legendFormat": "{{job}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Request Rate",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "HTTP 5xx error rate (percentage of total requests)",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.01 },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 1 },
+      "id": 2,
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "job:http_error_ratio:rate5m{job=~\"$job\"}",
+          "legendFormat": "{{job}} error rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Error Rate (5xx)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "HTTP request latency percentiles (p50, p95, p99)",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "red", "value": 2.0 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 1 },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "job:http_request_duration_p50:rate5m{job=~\"$job\"}",
+          "legendFormat": "p50 {{job}}",
+          "refId": "A"
+        },
+        {
+          "expr": "job:http_request_duration_p95:rate5m{job=~\"$job\"}",
+          "legendFormat": "p95 {{job}}",
+          "refId": "B"
+        },
+        {
+          "expr": "job:http_request_duration_p99:rate5m{job=~\"$job\"}",
+          "legendFormat": "p99 {{job}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Latency (p50/p95/p99)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "CPU and memory saturation across services",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 1 },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=~\"$namespace\",pod!=\"\"}[5m])) by (pod) / sum(kube_pod_container_resource_limits{namespace=~\"$namespace\",resource=\"cpu\",pod!=\"\"}) by (pod)",
+          "legendFormat": "CPU {{pod}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(container_memory_working_set_bytes{namespace=~\"$namespace\",pod!=\"\"}) by (pod) / sum(kube_pod_container_resource_limits{namespace=~\"$namespace\",resource=\"memory\",pod!=\"\"}) by (pod)",
+          "legendFormat": "MEM {{pod}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Saturation (CPU/Mem %limits)",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "id": 101,
+      "title": "📊 SLO Error Budget",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Error budget remaining as % of monthly SLO (target 99.9%)",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.1 },
+              { "color": "green", "value": 0.5 }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 10 },
+      "id": 10,
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "expr": "job:slo_error_budget_remaining:ratio{job=~\"$job\"}",
+          "legendFormat": "{{job}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Error Budget Remaining (30d)",
+      "type": "gauge"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "SLO burn rate — how fast error budget is being consumed",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2 },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 8, "w": 10, "x": 6, "y": 10 },
+      "id": 11,
+      "targets": [
+        {
+          "expr": "(1 - job:slo_availability:ratio_rate1h{job=~\"$job\"}) / (1 - 0.999)",
+          "legendFormat": "1h burn {{job}}",
+          "refId": "A"
+        },
+        {
+          "expr": "(1 - job:slo_availability:ratio_rate6h{job=~\"$job\"}) / (1 - 0.999)",
+          "legendFormat": "6h burn {{job}}",
+          "refId": "B"
+        }
+      ],
+      "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": 14.4 }] },
+      "title": "Burn Rate (1h / 6h)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "30-day availability SLI — rolling window",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.995 },
+              { "color": "green", "value": 0.999 }
+            ]
+          },
+          "unit": "percentunit",
+          "decimals": 4
+        }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
+      "id": 12,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "expr": "job:slo_availability:ratio_rate30d{job=~\"$job\"}",
+          "legendFormat": "{{job}}",
+          "refId": "A"
+        }
+      ],
+      "title": "30d Availability (SLI)",
+      "type": "stat"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "id": 102,
+      "title": "🤖 AI / LLM Agent Observability",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Projected LLM API cost per hour by agent and model",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "currencyUSD"
+        }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 19 },
+      "id": 20,
+      "targets": [
+        {
+          "expr": "agent:llm_cost:rate1h",
+          "legendFormat": "{{agent_name}} / {{model}}",
+          "refId": "A"
+        }
+      ],
+      "title": "LLM Cost ($/hr projected)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Token consumption rate by agent, model, and token type",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2 },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 19 },
+      "id": 21,
+      "targets": [
+        {
+          "expr": "agent:llm_tokens:rate5m",
+          "legendFormat": "{{agent_name}} {{token_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Token Rate (tokens/5m)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "LLM request latency (p50/p95) — model API call duration",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 19 },
+      "id": 22,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(llm_request_duration_seconds_bucket[5m])) by (model, le))",
+          "legendFormat": "p50 {{model}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[5m])) by (model, le))",
+          "legendFormat": "p95 {{model}}",
+          "refId": "B"
+        }
+      ],
+      "title": "LLM Latency (p50/p95)",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "id": 103,
+      "title": "☸️ Kubernetes Health",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Pod restart rate — crash looping pods signal instability",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 28 },
+      "id": 30,
+      "targets": [
+        {
+          "expr": "sum(rate(kube_pod_container_status_restarts_total{namespace=~\"$namespace\"}[15m])) by (pod, namespace) > 0",
+          "legendFormat": "{{namespace}}/{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Pod Restarts (crash loops)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Deployment replica availability vs desired",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 28 },
+      "id": 31,
+      "targets": [
+        {
+          "expr": "kube_deployment_spec_replicas{namespace=~\"$namespace\"}",
+          "legendFormat": "desired {{deployment}}",
+          "refId": "A"
+        },
+        {
+          "expr": "kube_deployment_status_available_replicas{namespace=~\"$namespace\"}",
+          "legendFormat": "available {{deployment}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Deployment Replicas",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Node-level resource pressure (CPU/memory/disk)",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 28 },
+      "id": 32,
+      "targets": [
+        {
+          "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+          "legendFormat": "CPU {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)",
+          "legendFormat": "MEM {{instance}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Node CPU & Memory",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "id": 104,
+      "title": "🌐 Traffic Engineering",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Active connections per upstream backend",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 36 },
+      "id": 40,
+      "targets": [
+        {
+          "expr": "traefik_service_server_up",
+          "legendFormat": "{{service}} backend {{url}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Traefik Backend Health",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Traefik request rate by entrypoint and service",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "reqps"
+        }
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 36 },
+      "id": 41,
+      "targets": [
+        {
+          "expr": "sum(rate(traefik_service_requests_total[5m])) by (service)",
+          "legendFormat": "{{service}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Traefik Request Rate",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "OTel Collector dropped spans and queue fill levels",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 36 },
+      "id": 42,
+      "targets": [
+        {
+          "expr": "sum(rate(otelcol_processor_dropped_spans[5m])) by (processor)",
+          "legendFormat": "dropped {{processor}}",
+          "refId": "A"
+        },
+        {
+          "expr": "otelcol_exporter_queue_size / otelcol_exporter_queue_capacity",
+          "legendFormat": "queue fill {{exporter}}",
+          "refId": "B"
+        }
+      ],
+      "title": "OTel Collector Health",
+      "type": "timeseries"
+    }
+
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["observability", "slo", "golden-signals", "ai-agents", "kubernetes", "finops"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Prometheus",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Loki",
+        "multi": false,
+        "name": "DS_LOKI",
+        "options": [],
+        "query": "loki",
+        "refresh": 1,
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": {},
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(http_requests_total, job)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Service / Job",
+        "multi": true,
+        "name": "job",
+        "query": {
+          "query": "label_values(http_requests_total, job)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {},
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(kube_pod_info, namespace)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Namespace",
+        "multi": true,
+        "name": "namespace",
+        "query": {
+          "query": "label_values(kube_pod_info, namespace)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-3h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Obs-Cost-Traffic: Golden Signals + SLO + AI Agents + K8s",
+  "uid": "obs-cost-traffic-v1",
+  "version": 1
+}

@@ -1,0 +1,325 @@
+# Authorizer Kyverno Policies — Production Baseline + Restricted
+# Covers: Pod Security, Image, Labels, NetworkPolicy generation, RBAC guardrails
+# Apply: kubectl apply -f kyverno_policies.yaml
+
+---
+# ============================================================
+# 1. ENFORCE: Require Non-Root + Drop ALL Capabilities
+# ============================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: authorizer-require-non-root
+  annotations:
+    policies.kyverno.io/title: Require Non-Root Containers
+    policies.kyverno.io/category: Pod Security (Restricted)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >-
+      All containers must run as non-root and drop ALL Linux capabilities.
+      Aligns with CIS K8s 5.2.5 and PSA restricted profile.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-non-root
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kube-system", "kyverno", "gatekeeper-system", "spire", "cert-manager"]
+      validate:
+        message: "Containers must set runAsNonRoot=true and drop ALL capabilities."
+        pattern:
+          spec:
+            containers:
+              - securityContext:
+                  runAsNonRoot: true
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop: ["ALL"]
+                  seccompProfile:
+                    type: RuntimeDefault
+
+---
+# ============================================================
+# 2. ENFORCE: Disallow Privileged Containers
+# ============================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: authorizer-disallow-privileged
+  annotations:
+    policies.kyverno.io/title: Disallow Privileged Containers
+    policies.kyverno.io/category: Pod Security (Baseline)
+    policies.kyverno.io/severity: critical
+    policies.kyverno.io/description: >-
+      Privileged containers share the host kernel and can escape containment.
+      CIS K8s 5.2.2. CVE-2022-0185 exploited privileged mode.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-privileged
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kube-system", "spire"]
+      validate:
+        message: "Privileged containers are not allowed."
+        pattern:
+          spec:
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): "false"
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"
+
+---
+# ============================================================
+# 3. ENFORCE: Disallow HostPath Volumes
+# ============================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: authorizer-disallow-host-path
+  annotations:
+    policies.kyverno.io/title: Disallow Host Path Volumes
+    policies.kyverno.io/category: Pod Security (Baseline)
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: host-path-volumes
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kube-system", "spire"]
+      validate:
+        message: "HostPath volumes are not allowed."
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.volumes[].hostPath | length(@) }}"
+                operator: GreaterThan
+                value: 0
+
+---
+# ============================================================
+# 4. ENFORCE: Require Specific Labels
+# ============================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: authorizer-require-labels
+  annotations:
+    policies.kyverno.io/title: Require Standard Labels
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-app-labels
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kube-system", "kyverno", "gatekeeper-system"]
+      validate:
+        message: "Deployments must have app.kubernetes.io/name, app.kubernetes.io/version, and team labels."
+        pattern:
+          metadata:
+            labels:
+              app.kubernetes.io/name: "?*"
+              app.kubernetes.io/version: "?*"
+              team: "?*"
+
+---
+# ============================================================
+# 5. ENFORCE: Disallow Latest Image Tag
+# ============================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: authorizer-disallow-latest-tag
+  annotations:
+    policies.kyverno.io/title: Disallow Latest Image Tag
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-image-tag
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kube-system", "kyverno"]
+      validate:
+        message: "Image tag ':latest' or untagged images are not allowed. Use a specific version tag."
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{element.image}}"
+                    operator: Equals
+                    value: "*:latest"
+                  - key: "{{element.image}}"
+                    operator: NotContains
+                    value: ":"
+
+---
+# ============================================================
+# 6. ENFORCE: Require Resource Limits
+# ============================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: authorizer-require-limits
+  annotations:
+    policies.kyverno.io/title: Require Resource Limits
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-resource-limits
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["production", "staging"]
+      validate:
+        message: "Containers in production/staging must define CPU and memory limits."
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  limits:
+                    cpu: "?*"
+                    memory: "?*"
+
+---
+# ============================================================
+# 7. MUTATE: Add Default Security Context
+# ============================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: authorizer-mutate-security-context
+  annotations:
+    policies.kyverno.io/title: Add Default Security Context
+    policies.kyverno.io/category: Mutation
+    policies.kyverno.io/severity: medium
+spec:
+  rules:
+    - name: add-security-context
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kube-system", "kyverno"]
+      mutate:
+        patchStrategicMerge:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+
+---
+# ============================================================
+# 8. GENERATE: Default NetworkPolicy per namespace
+# ============================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: authorizer-generate-default-netpol
+  annotations:
+    policies.kyverno.io/title: Generate Default Deny NetworkPolicy
+    policies.kyverno.io/category: Network Security
+    policies.kyverno.io/severity: high
+spec:
+  rules:
+    - name: generate-default-deny
+      match:
+        any:
+          - resources:
+              kinds: ["Namespace"]
+              selector:
+                matchLabels:
+                  authorizer.io/network-policy: "default-deny"
+      generate:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: default-deny-all
+        namespace: "{{request.object.metadata.name}}"
+        synchronize: true
+        data:
+          metadata:
+            labels:
+              authorizer.io/managed: "true"
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Ingress
+              - Egress
+
+---
+# ============================================================
+# 9. ENFORCE: Disallow Cluster-Admin Bindings to Non-Admins
+# ============================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: authorizer-restrict-cluster-admin
+  annotations:
+    policies.kyverno.io/title: Restrict Cluster-Admin ClusterRoleBindings
+    policies.kyverno.io/category: RBAC Security
+    policies.kyverno.io/severity: critical
+spec:
+  validationFailureAction: Audit    # Start in Audit — move to Enforce after baseline cleanup
+  background: true
+  rules:
+    - name: check-cluster-admin-crb
+      match:
+        any:
+          - resources:
+              kinds: ["ClusterRoleBinding"]
+      validate:
+        message: "ClusterRoleBinding to cluster-admin requires security team approval."
+        deny:
+          conditions:
+            any:
+              - key: "{{request.object.roleRef.name}}"
+                operator: Equals
+                value: "cluster-admin"
+              # Allow system subjects
+              - key: "{{request.object.subjects[].name | contains(@, 'system:') | to_string(@)}}"
+                operator: Equals
+                value: "false"

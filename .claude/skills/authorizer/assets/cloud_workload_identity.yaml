@@ -1,0 +1,206 @@
+# Authorizer Cloud Workload Identity — AWS IRSA, GCP WI, Azure AAD
+# Per-cloud SA annotation templates + OIDC federation configs
+# Replace: ACCOUNT_ID, PROJECT_ID, TENANT_ID, SUBSCRIPTION_ID
+
+---
+# ============================================================
+# AWS: IRSA + EKS Pod Identity ServiceAccounts
+# ============================================================
+
+# IRSA ServiceAccount — annotate with IAM role ARN
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aws-backend-sa
+  namespace: team-backend
+  labels:
+    cloud.authorizer.io/provider: "aws"
+    cloud.authorizer.io/mechanism: "irsa"
+    team: backend
+  annotations:
+    # IRSA: bound to IAM role via OIDC trust policy
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/team-backend-role"
+    # Use regional STS for lower latency + avoid global STS throttle
+    eks.amazonaws.com/sts-regional-endpoints: "true"
+    # Short-lived token (match IAM session duration)
+    eks.amazonaws.com/token-expiration: "3600"
+automountServiceAccountToken: false
+
+---
+# EKS Pod Identity ServiceAccount (newer, preferred over IRSA)
+# No annotation needed — binding done via AWS Console/CLI
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aws-backend-pod-identity-sa
+  namespace: team-backend
+  labels:
+    cloud.authorizer.io/provider: "aws"
+    cloud.authorizer.io/mechanism: "pod-identity"
+    team: backend
+  annotations:
+    cloud.authorizer.io/iam-role: "arn:aws:iam::ACCOUNT_ID:role/team-backend-pod-identity-role"
+    cloud.authorizer.io/setup-cmd: >-
+      eksctl create podidentityassociation
+      --cluster CLUSTER_NAME
+      --namespace team-backend
+      --service-account-name aws-backend-pod-identity-sa
+      --role-arn arn:aws:iam::ACCOUNT_ID:role/team-backend-pod-identity-role
+automountServiceAccountToken: false
+
+---
+# AI Agent SA — EKS IRSA scoped to Bedrock + S3 only
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llm-agent-aws-sa
+  namespace: ai-workloads
+  labels:
+    cloud.authorizer.io/provider: "aws"
+    cloud.authorizer.io/mechanism: "irsa"
+    app.kubernetes.io/component: "ai-agent"
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/llm-agent-bedrock-s3-role"
+    eks.amazonaws.com/sts-regional-endpoints: "true"
+    eks.amazonaws.com/token-expiration: "1800"   # 30 min for agents
+    cloud.authorizer.io/iam-policy: >-
+      {"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["bedrock:InvokeModel"],"Resource":"arn:aws:bedrock:us-east-1::foundation-model/*"},
+        {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::company-ai-data/*"}
+      ]}
+automountServiceAccountToken: false
+
+---
+# ============================================================
+# GCP: Workload Identity ServiceAccounts
+# ============================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gcp-backend-sa
+  namespace: team-backend
+  labels:
+    cloud.authorizer.io/provider: "gcp"
+    cloud.authorizer.io/mechanism: "workload-identity"
+    team: backend
+  annotations:
+    # Binds KSA to Google Service Account
+    iam.gke.io/gcp-service-account: "backend-app@PROJECT_ID.iam.gserviceaccount.com"
+    cloud.authorizer.io/setup-cmd: >-
+      gcloud iam service-accounts add-iam-policy-binding
+      backend-app@PROJECT_ID.iam.gserviceaccount.com
+      --role roles/iam.workloadIdentityUser
+      --member "serviceAccount:PROJECT_ID.svc.id.goog[team-backend/gcp-backend-sa]"
+automountServiceAccountToken: false
+
+---
+# GCP AI Agent — Vertex AI + GCS scoped
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llm-agent-gcp-sa
+  namespace: ai-workloads
+  labels:
+    cloud.authorizer.io/provider: "gcp"
+    cloud.authorizer.io/mechanism: "workload-identity"
+    app.kubernetes.io/component: "ai-agent"
+  annotations:
+    iam.gke.io/gcp-service-account: "llm-agent@PROJECT_ID.iam.gserviceaccount.com"
+    cloud.authorizer.io/gcp-roles: "roles/aiplatform.user,roles/storage.objectViewer"
+    cloud.authorizer.io/setup-cmd: >-
+      gcloud iam service-accounts add-iam-policy-binding
+      llm-agent@PROJECT_ID.iam.gserviceaccount.com
+      --role roles/iam.workloadIdentityUser
+      --member "serviceAccount:PROJECT_ID.svc.id.goog[ai-workloads/llm-agent-gcp-sa]"
+automountServiceAccountToken: false
+
+---
+# ============================================================
+# Azure: Workload Identity (AAD Federated Credential)
+# ============================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: azure-backend-sa
+  namespace: team-backend
+  labels:
+    azure.workload.identity/use: "true"
+    cloud.authorizer.io/provider: "azure"
+    cloud.authorizer.io/mechanism: "workload-identity"
+    team: backend
+  annotations:
+    azure.workload.identity/client-id: "AZURE_CLIENT_ID"
+    azure.workload.identity/tenant-id: "AZURE_TENANT_ID"
+    cloud.authorizer.io/azure-role: "Storage Blob Data Reader"
+    cloud.authorizer.io/setup-cmd: >-
+      az ad app federated-credential create
+      --id AZURE_APP_OBJECT_ID
+      --parameters '{"name":"backend-federated","issuer":"OIDC_ISSUER_URL",
+      "subject":"system:serviceaccount:team-backend:azure-backend-sa",
+      "audiences":["api://AzureADTokenExchange"]}'
+automountServiceAccountToken: false
+
+---
+# Azure AI Agent — Azure OpenAI + Blob scoped
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llm-agent-azure-sa
+  namespace: ai-workloads
+  labels:
+    azure.workload.identity/use: "true"
+    cloud.authorizer.io/provider: "azure"
+    cloud.authorizer.io/mechanism: "workload-identity"
+    app.kubernetes.io/component: "ai-agent"
+  annotations:
+    azure.workload.identity/client-id: "AZURE_OPENAI_CLIENT_ID"
+    azure.workload.identity/tenant-id: "AZURE_TENANT_ID"
+    cloud.authorizer.io/azure-roles: "Cognitive Services OpenAI User,Storage Blob Data Reader"
+automountServiceAccountToken: false
+
+---
+# ============================================================
+# Projected ServiceAccount Token Volume — use in Pods
+# ============================================================
+# Add this to Pod spec when automountServiceAccountToken: false
+# volumes:
+#   - name: sa-token
+#     projected:
+#       sources:
+#         - serviceAccountToken:
+#             path: token
+#             expirationSeconds: 3600
+#             audience: "https://kubernetes.default.svc"
+#
+# containers:
+#   - volumeMounts:
+#       - name: sa-token
+#         mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+#         readOnly: true
+
+---
+# ============================================================
+# Multi-Cloud: On-Prem OIDC (Dex / Keycloak) SA
+# ============================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: on-prem-backend-sa
+  namespace: team-backend
+  labels:
+    cloud.authorizer.io/provider: "on-prem"
+    cloud.authorizer.io/mechanism: "vault-agent"
+    team: backend
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "team-backend-role"
+    vault.hashicorp.com/agent-inject-secret-config: "secret/data/team-backend/config"
+    vault.hashicorp.com/agent-inject-template-config: |
+      {{- with secret "secret/data/team-backend/config" -}}
+      DB_URL={{ .Data.data.db_url }}
+      API_KEY={{ .Data.data.api_key }}
+      {{- end -}}
+automountServiceAccountToken: false

@@ -1,0 +1,460 @@
+# Kubernetes Observability Stack — Helm Values
+# kube-prometheus-stack + OTel Operator + Loki + Tempo
+# Docs: https://github.com/prometheus-community/helm-charts
+
+# =============================================================================
+# kube-prometheus-stack values
+# helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#   -n monitoring --create-namespace -f k8s_observability_stack.yaml
+# =============================================================================
+
+# --- Prometheus ---
+prometheus:
+  prometheusSpec:
+    # Retention policy
+    retention: 15d
+    retentionSize: "50GB"
+
+    # Persistent storage
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3   # AWS; use standard-rwo for GKE, managed-premium for AKS
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 100Gi
+
+    # Resource limits
+    resources:
+      requests:
+        memory: 2Gi
+        cpu: 500m
+      limits:
+        memory: 6Gi
+        cpu: 2000m
+
+    # Remote write (optional — Grafana Cloud, Thanos, Mimir)
+    remoteWrite:
+      - url: "${GRAFANA_REMOTE_WRITE_URL}"
+        basicAuth:
+          username:
+            name: grafana-cloud-secret
+            key: username
+          password:
+            name: grafana-cloud-secret
+            key: password
+        writeRelabelConfigs:
+          # Drop high-cardinality/low-value metrics
+          - sourceLabels: [__name__]
+            regex: "go_memstats_.*|go_gc_.*"
+            action: drop
+
+    # Scrape all PodMonitor and ServiceMonitor resources
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+    # External labels for multi-cluster federation
+    externalLabels:
+      cluster: "${CLUSTER_NAME}"
+      region: "${AWS_REGION}"
+
+    # Additional scrape configs (if needed)
+    additionalScrapeConfigs:
+      - job_name: "otel-collector"
+        static_configs:
+          - targets: ["otel-collector.monitoring.svc:8889"]
+
+  # Prometheus Operator
+  operator:
+    resources:
+      limits:
+        memory: 256Mi
+        cpu: 200m
+
+# --- Alertmanager ---
+alertmanager:
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          resources:
+            requests:
+              storage: 10Gi
+    resources:
+      requests:
+        memory: 128Mi
+        cpu: 50m
+      limits:
+        memory: 256Mi
+
+  config:
+    global:
+      resolve_timeout: 5m
+      slack_api_url: "${SLACK_WEBHOOK_URL}"
+
+    route:
+      group_by: ["alertname", "cluster", "namespace", "service"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: "default"
+      routes:
+        - match:
+            severity: critical
+          receiver: pagerduty
+          continue: true
+        - match:
+            slo: availability
+          receiver: slo-slack
+
+    receivers:
+      - name: default
+        slack_configs:
+          - channel: "#platform-alerts"
+            title: "[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}"
+            text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+            send_resolved: true
+
+      - name: pagerduty
+        pagerduty_configs:
+          - routing_key: "${PAGERDUTY_ROUTING_KEY}"
+            severity: "{{ .CommonLabels.severity }}"
+            description: "{{ .CommonAnnotations.summary }}"
+
+      - name: slo-slack
+        slack_configs:
+          - channel: "#slo-alerts"
+            title: "SLO Alert: {{ .GroupLabels.alertname }}"
+            send_resolved: true
+
+    inhibit_rules:
+      - source_match:
+          severity: critical
+        target_match:
+          severity: warning
+        equal: ["alertname", "cluster", "namespace"]
+
+# --- Grafana ---
+grafana:
+  adminPassword: "${GRAFANA_ADMIN_PASSWORD}"
+
+  persistence:
+    enabled: true
+    storageClassName: gp3
+    size: 20Gi
+
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+
+  # Auto-provision datasources
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      url: http://loki.monitoring.svc:3100
+      access: proxy
+      jsonData:
+        derivedFields:
+          - name: "TraceID"
+            matcherRegex: '"trace_id":"(\w+)"'
+            url: "${__value.raw}"
+            datasourceUid: tempo
+
+    - name: Tempo
+      type: tempo
+      uid: tempo
+      url: http://tempo.monitoring.svc:3200
+      access: proxy
+      jsonData:
+        tracesToLogsV2:
+          datasourceUid: loki
+          filterByTraceID: true
+          filterBySpanID: true
+        serviceMap:
+          datasourceUid: prometheus
+        nodeGraph:
+          enabled: true
+        search:
+          hide: false
+
+  # Dashboard provisioning
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: "platform"
+          folder: "Platform"
+          type: file
+          options:
+            path: /var/lib/grafana/dashboards/platform
+        - name: "slos"
+          folder: "SLOs"
+          type: file
+          options:
+            path: /var/lib/grafana/dashboards/slos
+        - name: "kubernetes"
+          folder: "Kubernetes"
+          type: file
+          options:
+            path: /var/lib/grafana/dashboards/kubernetes
+
+  grafana.ini:
+    feature_toggles:
+      enable: traceToMetrics tempoServiceGraph
+    unified_alerting:
+      enabled: true
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+    security:
+      cookie_secure: true
+      strict_transport_security: true
+
+  # Ingress for Grafana UI
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    hosts:
+      - grafana.example.com
+    tls:
+      - secretName: grafana-tls
+        hosts:
+          - grafana.example.com
+
+# --- Node Exporter ---
+nodeExporter:
+  enabled: true
+  resources:
+    requests:
+      memory: 64Mi
+      cpu: 30m
+    limits:
+      memory: 128Mi
+
+# --- kube-state-metrics ---
+kubeStateMetrics:
+  enabled: true
+
+# --- Default rules ---
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: true
+    general: true
+    kubeApiserver: true
+    kubeApiserverAvailability: true
+    kubeApiserverBurnrate: true
+    kubeApiserverHistogram: true
+    kubeApiserverSlos: true
+    kubelet: true
+    kubePrometheusGeneral: true
+    kubePrometheusNodeRecording: true
+    kubernetesAbsent: true
+    kubernetesApps: true
+    kubernetesResources: true
+    kubernetesStorage: true
+    kubernetesSystem: true
+    kubeScheduler: true
+    kubeStateMetrics: true
+    network: true
+    node: true
+    nodeExporterAlerting: true
+    nodeExporterRecording: true
+    prometheus: true
+    prometheusOperator: true
+
+---
+# =============================================================================
+# OTel Operator (separate release)
+# helm install otel-operator open-telemetry/opentelemetry-operator \
+#   -n opentelemetry-operator-system --create-namespace
+# =============================================================================
+# OpenTelemetryCollector CR — deployed after operator
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: cluster-collector
+  namespace: monitoring
+spec:
+  mode: DaemonSet
+  image: otel/opentelemetry-collector-contrib:0.116.0
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+  env:
+    - name: DEPLOYMENT_ENV
+      value: "production"
+    - name: CLUSTER_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+  config: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      kubeletstats:
+        collection_interval: 20s
+        auth_type: serviceAccount
+        endpoint: "${K8S_NODE_NAME}:10250"
+        insecure_skip_verify: true
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 400
+        spike_limit_mib: 100
+      batch:
+        send_batch_size: 1000
+        timeout: 1s
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.deployment.name
+            - k8s.node.name
+
+    exporters:
+      otlp:
+        endpoint: "otel-gateway.monitoring.svc:4317"
+        tls:
+          insecure: true
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, batch]
+          exporters: [otlp]
+        metrics:
+          receivers: [otlp, kubeletstats]
+          processors: [memory_limiter, k8sattributes, batch]
+          exporters: [otlp]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, batch]
+          exporters: [otlp]
+
+---
+# Instrumentation CR — auto-instrument namespaces
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: auto-instrumentation
+  namespace: production
+spec:
+  exporter:
+    endpoint: http://otel-collector.monitoring.svc:4318
+  propagators:
+    - tracecontext
+    - baggage
+    - b3
+  sampler:
+    type: parentbased_traceidratio
+    argument: "0.1"    # 10% sampling rate
+  python:
+    env:
+      - name: OTEL_LOGS_EXPORTER
+        value: otlp
+  nodejs:
+    env:
+      - name: OTEL_LOGS_EXPORTER
+        value: otlp
+  java:
+    env:
+      - name: OTEL_LOGS_EXPORTER
+        value: otlp
+  dotnet:
+    env:
+      - name: OTEL_LOGS_EXPORTER
+        value: otlp
+
+---
+# =============================================================================
+# Loki Stack (separate release)
+# helm install loki grafana/loki -n monitoring -f loki-values.yaml
+# =============================================================================
+# loki-values.yaml
+loki:
+  commonConfig:
+    replication_factor: 1
+
+  storage:
+    type: s3
+    s3:
+      s3: "s3://my-loki-bucket/loki"
+      region: "${AWS_REGION}"
+      s3ForcePathStyle: false
+
+  schemaConfig:
+    configs:
+      - from: "2024-01-01"
+        store: tsdb
+        object_store: s3
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+
+  limits_config:
+    retention_period: 30d
+    ingestion_rate_mb: 32
+    ingestion_burst_size_mb: 64
+    max_label_names_per_series: 20
+    max_streams_per_user: 10000
+
+singleBinary:
+  replicas: 1
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: 250m
+    limits:
+      memory: 2Gi
+
+---
+# =============================================================================
+# Tempo (separate release)
+# helm install tempo grafana/tempo -n monitoring -f tempo-values.yaml
+# =============================================================================
+# tempo-values.yaml
+tempo:
+  storage:
+    trace:
+      backend: s3
+      s3:
+        bucket: my-tempo-bucket
+        endpoint: s3.amazonaws.com
+        region: "${AWS_REGION}"
+
+  retention: 168h   # 7 days
+
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: 250m
+    limits:
+      memory: 2Gi
+
+tempoQuery:
+  enabled: true

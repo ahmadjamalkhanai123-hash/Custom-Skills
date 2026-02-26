@@ -1,0 +1,362 @@
+# Cost Engineering Configuration
+# AWS Budgets, GCP Budgets, Azure Budgets, Kubernetes Cost (Kubecost), Tagging
+# Reference: https://docs.aws.amazon.com/cost-management/
+#             https://cloud.google.com/billing/docs
+#             https://learn.microsoft.com/en-us/azure/cost-management-billing/
+
+# =============================================================================
+# AWS COST CONFIGURATION
+# =============================================================================
+aws:
+  budgets:
+    # Monthly total budget
+    - name: production-monthly-total
+      amount_usd: 10000
+      type: COST
+      time_unit: MONTHLY
+      filters:
+        tags:
+          env: production
+      notifications:
+        - threshold_percent: 50
+          type: ACTUAL
+          channels: [email, sns]
+        - threshold_percent: 80
+          type: ACTUAL
+          channels: [email, sns, pagerduty]
+        - threshold_percent: 100
+          type: ACTUAL
+          channels: [email, sns, pagerduty]
+        - threshold_percent: 110
+          type: FORECASTED
+          channels: [email, pagerduty]
+
+    # Per-team budgets
+    - name: platform-team-monthly
+      amount_usd: 3000
+      type: COST
+      time_unit: MONTHLY
+      filters:
+        tags:
+          team: platform
+          env: production
+
+    - name: ai-agents-monthly
+      amount_usd: 2000
+      type: COST
+      time_unit: MONTHLY
+      filters:
+        tags:
+          service: ai-agents
+      notifications:
+        - threshold_percent: 60
+          type: ACTUAL
+          channels: [email, slack]
+        - threshold_percent: 90
+          type: ACTUAL
+          channels: [email, pagerduty]
+
+    # Dev/Staging budget (should be much lower)
+    - name: dev-staging-monthly
+      amount_usd: 1000
+      type: COST
+      time_unit: MONTHLY
+      filters:
+        tags:
+          env: [dev, staging]
+      notifications:
+        - threshold_percent: 75
+          type: FORECASTED
+          channels: [email]
+
+  # Cost Anomaly Detection
+  anomaly_detection:
+    monitors:
+      - name: per-service-anomaly
+        type: DIMENSIONAL
+        dimension: SERVICE
+        threshold_expression: "ANOMALY_TOTAL_IMPACT_ABSOLUTE > 100"  # Alert if >$100 anomaly
+        subscribers:
+          - type: EMAIL
+            address: finops@example.com
+          - type: SNS
+            arn: "arn:aws:sns:us-east-1:123456789:cost-anomaly"
+
+  # Savings Plans (configure in Console; document here for tracking)
+  savings_plans:
+    compute:
+      commitment_hourly_usd: 50.00   # $36K/year commitment → ~35% savings
+      term: ONE_YEAR
+      payment: NO_UPFRONT
+    ec2:
+      - instance_family: m5
+        region: us-east-1
+        commitment_hourly_usd: 20.00
+        term: ONE_YEAR
+        payment: PARTIAL_UPFRONT
+
+  # Required tags (enforced via SCP)
+  required_tags:
+    - key: env
+      allowed_values: [dev, staging, production, sandbox]
+    - key: team
+      pattern: "^[a-z][a-z-]+$"
+    - key: service
+      pattern: "^[a-z][a-z-]+$"
+    - key: cost-center
+      pattern: "^CC-[0-9]{4}$"
+    - key: project
+      required_for_services: [ec2, rds, eks]
+
+  # Cost allocation tags (must be activated in Billing Console)
+  cost_allocation_tags:
+    - env
+    - team
+    - service
+    - project
+    - cost-center
+
+  # Auto-stop dev/staging instances (via EventBridge + Lambda)
+  scheduled_scaling:
+    - name: stop-dev-instances
+      cron: "0 20 * * MON-FRI"    # 8PM on weekdays
+      action: STOP
+      targets:
+        tag_filter:
+          env: [dev, staging]
+    - name: start-dev-instances
+      cron: "0 8 * * MON-FRI"     # 8AM on weekdays
+      action: START
+      targets:
+        tag_filter:
+          env: [dev, staging]
+
+# =============================================================================
+# GCP COST CONFIGURATION
+# =============================================================================
+gcp:
+  budgets:
+    # Production total
+    - name: production-monthly
+      amount_usd: 10000
+      projects:
+        - my-project-production
+      labels:
+        environment: production
+      threshold_rules:
+        - threshold_percent: 0.5
+          basis: CURRENT_SPEND
+        - threshold_percent: 0.8
+          basis: CURRENT_SPEND
+        - threshold_percent: 1.0
+          basis: CURRENT_SPEND
+        - threshold_percent: 1.1
+          basis: FORECASTED_SPEND
+      notifications:
+        pubsub_topic: projects/my-project/topics/billing-alerts
+
+    # AI/ML workloads
+    - name: ai-ml-monthly
+      amount_usd: 3000
+      labels:
+        workload: ai-agents
+
+  # Committed Use Discounts tracking
+  committed_use_discounts:
+    compute:
+      - resource_type: VCPU
+        region: us-central1
+        commitment: 100
+        term: 12_MONTH
+      - resource_type: MEMORY
+        region: us-central1
+        commitment: 400  # GB
+        term: 12_MONTH
+
+  # Labels policy (equivalent to AWS tags)
+  required_labels:
+    - key: environment
+      values: [dev, staging, production]
+    - key: team
+    - key: service
+    - key: cost-center
+
+  # BigQuery billing export (for cost analysis)
+  billing_export:
+    dataset: billing_export
+    project: my-billing-project
+    table_prefix: gcp_billing_export_v1
+    enable_resource_export: true
+    enable_detailed_export: true
+
+# =============================================================================
+# AZURE COST CONFIGURATION
+# =============================================================================
+azure:
+  budgets:
+    # Subscription-level budget
+    - name: production-subscription-monthly
+      scope: subscription
+      amount_usd: 10000
+      time_grain: Monthly
+      start_date: "2026-02-01"
+      filters:
+        tags:
+          env: production
+      notifications:
+        - operator: GreaterThan
+          threshold: 50
+          contact_emails: [finops@example.com]
+          threshold_type: Actual
+        - operator: GreaterThan
+          threshold: 80
+          contact_emails: [finops@example.com]
+          contact_roles: [Owner, Contributor]
+          threshold_type: Actual
+        - operator: GreaterThan
+          threshold: 100
+          contact_emails: [finops@example.com]
+          contact_roles: [Owner]
+          threshold_type: Forecasted
+
+    # Resource group budget (per team)
+    - name: platform-team-rg-monthly
+      scope: resource_group
+      resource_group: rg-platform-production
+      amount_usd: 3000
+      time_grain: Monthly
+
+  # Required tags (enforced via Azure Policy)
+  required_tags:
+    - key: env
+      effect: Deny  # Deny resource creation without tag
+    - key: team
+      effect: Deny
+    - key: service
+      effect: Audit
+    - key: cost-center
+      effect: Audit
+
+  # Cost Management export (to Storage for analysis)
+  exports:
+    - name: daily-cost-export
+      schedule: Daily
+      recurrence: Monthly
+      start_date: "2026-02-01"
+      storage_account: mystorageaccount
+      container: cost-exports
+      directory: azure-costs
+      format: Csv
+      type: ActualCost
+
+  # Azure Advisor recommendations (auto-enable)
+  advisor:
+    categories: [Cost, HighAvailability, Performance, Security]
+    low_cpu_threshold: 5  # Alert if VM avg CPU < 5%
+    auto_apply: false     # Review before applying
+
+# =============================================================================
+# KUBERNETES COST (KUBECOST)
+# =============================================================================
+kubecost:
+  # Allocation targets (showback/chargeback)
+  allocation_query:
+    window: 7d
+    aggregate_by: namespace  # Options: namespace, pod, label, annotation, service
+
+  # Cost budgets (per namespace)
+  namespace_budgets:
+    - namespace: production
+      monthly_budget_usd: 5000
+      alert_threshold_percent: 80
+    - namespace: staging
+      monthly_budget_usd: 500
+      alert_threshold_percent: 90
+    - namespace: ai-agents
+      monthly_budget_usd: 2000
+      alert_threshold_percent: 70
+
+  # Rightsizing configuration
+  rightsizing:
+    algorithm: "max"  # Use max observed usage for recommendations
+    window: "7d"      # Look at 7 days of usage
+    add_safety_margin: 0.20   # Add 20% buffer to recommendations
+    min_savings_percent: 10   # Only recommend if >10% savings
+
+  # Network cost tracking
+  network_costs:
+    enabled: true
+    internet_egress_cost_per_gb: 0.09      # AWS us-east-1
+    cross_region_egress_cost_per_gb: 0.02
+    cross_az_egress_cost_per_gb: 0.01
+
+  # Cloud cost integration (for accurate pricing)
+  cloud_integration:
+    provider: aws
+    athena:
+      bucket: my-cur-bucket
+      region: us-east-1
+      database: athenacurcfn
+      table: cur_reports
+      workgroup: primary
+
+  # Reports (weekly email)
+  reports:
+    - name: weekly-cost-report
+      schedule: "0 9 * * MON"  # Monday 9AM
+      type: allocation
+      window: lastWeek
+      aggregate: namespace
+      recipients:
+        - finops@example.com
+        - platform-lead@example.com
+
+# =============================================================================
+# FINOPS GOVERNANCE
+# =============================================================================
+finops:
+  framework_phase: walk   # crawl | walk | run
+
+  # Review cadence
+  reviews:
+    weekly:
+      attendees: [platform-lead, finops]
+      agenda:
+        - Review top-10 cost drivers
+        - Check budget utilization
+        - Review anomaly alerts
+        - Action items from last week
+    monthly:
+      attendees: [cto, platform-lead, finops, team-leads]
+      agenda:
+        - Monthly summary vs budget
+        - Savings opportunities
+        - Commitment purchase decisions
+        - Next month forecast
+
+  # Cost allocation model
+  allocation:
+    model: showback  # showback (report only) or chargeback (actual billing)
+    allocation_basis: actual  # actual | budgeted
+    shared_cost_split:
+      by: team_headcount    # Split platform costs by team size
+      shared_services:
+        - monitoring
+        - logging
+        - ci-cd
+
+  # Waste elimination targets
+  waste_targets:
+    idle_resources_percent: 5   # Target <5% idle resources
+    over_provisioned_percent: 10  # Target <10% over-provisioned
+    untagged_percent: 1           # Target <1% untagged
+
+  # Observability cost limits
+  observability_cost_limit:
+    percent_of_total_cloud_spend: 5  # Target <5% of total on monitoring
+    monthly_cap_usd: 500             # Hard monthly cap on observability tools
+    strategies:
+      - sample_info_logs_at: 10%
+      - tail_sample_traces_at: 10%
+      - drop_high_cardinality_metrics: true
+      - use_loki_over_cloudwatch: true  # 10x cheaper
